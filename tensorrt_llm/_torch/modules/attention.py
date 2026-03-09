@@ -461,6 +461,7 @@ class Attention(nn.Module):
 
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+        self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
 
         qkv_shard_indices_mapping = {
             "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
@@ -1128,6 +1129,7 @@ class MLA(nn.Module):
 
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+        self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
 
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
@@ -2211,9 +2213,14 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                bmm_fn = lambda: torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    q_nope_t, self.k_b_proj_trans, q_nope_out)
+            else:
+                bmm_fn = lambda: torch.ops.trtllm.bmm_out(
+                    q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out)
             maybe_execute_in_parallel(
-                lambda: torch.ops.trtllm.bmm_out(
-                    q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
+                bmm_fn,
                 lambda: self.mqa.mla_rope_generation(
                     fused_q,
                     q_pe,
@@ -2310,9 +2317,14 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    attn_out_latent.transpose(0, 1), self.v_b_proj,
+                    attn_output.transpose(0, 1))
+            else:
+                torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                            self.v_b_proj.transpose(1, 2),
+                                            attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,
@@ -2363,9 +2375,13 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope_t,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    q_nope_t, self.k_b_proj_trans, q_nope_out)
+            else:
+                torch.ops.trtllm.bmm_out(q_nope_t,
+                                         self.k_b_proj_trans.transpose(1, 2),
+                                         q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
@@ -2422,9 +2438,14 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    attn_out_latent.transpose(0, 1), self.v_b_proj,
+                    attn_output.transpose(0, 1))
+            else:
+                torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                         self.v_b_proj.transpose(1, 2),
+                                         attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,
@@ -2487,9 +2508,13 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope_t,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    q_nope_t, self.k_b_proj_trans, q_nope_out)
+            else:
+                torch.ops.trtllm.bmm_out(q_nope_t,
+                                         self.k_b_proj_trans.transpose(1, 2),
+                                         q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = q_nope_out.transpose(0, 1)
@@ -2567,9 +2592,14 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    attn_out_latent.transpose(0, 1), self.v_b_proj,
+                    attn_output.transpose(0, 1))
+            else:
+                torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                         self.v_b_proj.transpose(1, 2),
+                                         attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,

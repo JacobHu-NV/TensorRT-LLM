@@ -486,6 +486,7 @@ class ModelLoader:
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
             video_pruning_rate=self.llm_args.video_pruning_rate,
+            use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)

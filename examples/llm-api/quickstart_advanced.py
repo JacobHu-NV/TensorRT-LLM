@@ -198,6 +198,12 @@ def add_llm_args(parser):
     parser.add_argument('--relaxed_topk', type=int, default=1)
     parser.add_argument('--relaxed_delta', type=float, default=0.)
 
+    # CuTe DSL
+    parser.add_argument('--use_cute_dsl_bf16_bmm',
+                        default=False,
+                        action='store_true',
+                        help='Use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.')
+
     # HF
     parser.add_argument('--trust_remote_code',
                         default=False,
@@ -326,6 +332,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        use_cute_dsl_bf16_bmm=args.use_cute_dsl_bf16_bmm,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
