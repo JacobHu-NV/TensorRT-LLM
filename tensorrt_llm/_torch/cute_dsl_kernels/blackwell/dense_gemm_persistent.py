@@ -598,15 +598,27 @@ class PersistentDenseGemmKernel:
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
+                # Reset ACCUMULATE for each new output tile
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
                 for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
                         handle = ab_consumer.wait_and_advance(
                             peek_ab_full_status)
 
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        tile_crd = (None, None, None, handle.index)
-                        cute.gemm(tiled_mma, tCtAcc, tCrA[tile_crd],
-                                  tCrB[tile_crd], tCtAcc)
+                        # Inner loop over kblocks within each K tile.
+                        # Set ACCUMULATE=True after first gemm call to
+                        # avoid clearing the accumulator on each sub-MMA.
+                        num_kblocks = cute.size(tCrA, mode=[2])
+                        for kblock_idx in cutlass.range(
+                                num_kblocks, unroll_full=True):
+                            kblock_crd = (None, None, kblock_idx,
+                                          handle.index)
+                            cute.gemm(tiled_mma, tCtAcc,
+                                      tCrA[kblock_crd],
+                                      tCrB[kblock_crd], tCtAcc)
+                            tiled_mma.set(
+                                tcgen05.Field.ACCUMULATE, True)
 
                         handle.release()
 
