@@ -462,6 +462,7 @@ class Attention(nn.Module):
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
+        self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         qkv_shard_indices_mapping = {
             "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
@@ -1130,6 +1131,7 @@ class MLA(nn.Module):
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
+        self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
@@ -1141,7 +1143,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -1158,7 +1161,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -1169,7 +1173,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -1182,7 +1187,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -1200,7 +1206,8 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_absorption only

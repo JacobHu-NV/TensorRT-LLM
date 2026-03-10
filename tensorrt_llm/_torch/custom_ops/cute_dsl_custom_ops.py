@@ -4479,3 +4479,284 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL bf16 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL bf16 bmm output shape is incorrect"
+
+    # ======================================================================
+    # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
+    # ======================================================================
+
+    class CuteDSLBf16BlackwellGemmRunner(TunableRunner):
+        """
+        CuTe DSL BF16 GEMM runner for Linear layers.
+
+        Unlike BMM which operates on [B, M, K] @ [B, N, K] -> [B, M, N],
+        GEMM operates on [M, K] @ [N, K]^T -> [M, N] (standard Linear).
+
+        We reuse PersistentDenseGemmKernel with batch_size=1.
+        """
+        kernel_class = PersistentDenseGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+        )
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__()
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL BF16 GEMM only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+
+            # input: [M, K], weight: [N, K]
+            m, k = inputs[0].shape[0], inputs[0].shape[1]
+            n = inputs[1].shape[0]
+            batch_size = 1
+
+            # Layouts: A is [M, K] K-major, B is [N, K] K-major
+            a_major = "k"
+            b_major = "k"
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.BFloat16,  # ab_dtype
+                    cutlass.Float32,  # acc_dtype
+                    cutlass.BFloat16,  # c_dtype
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            """
+            Performs bf16 dense persistent GEMM using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (m, k), dtype: bf16.
+                    inputs[1]: Weight tensor of shape (n, k), dtype: bf16.
+                    inputs[2]: Output tensor of shape (m, n), dtype: bf16.
+                tactic: Tiling and cluster strategy, typically a tuple
+                    (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a_tensor, b_tensor, c_tensor = inputs
+
+            # Input: [M, K], Weight: [N, K], Output: [M, N]
+            m, k = a_tensor.shape[0], a_tensor.shape[1]
+            n = b_tensor.shape[0]
+            batch_size = 1
+
+            # Ensure inputs are contiguous
+            a_tensor = a_tensor.contiguous()
+            b_tensor = b_tensor.contiguous()
+
+            # For output, use contiguous buffer if needed
+            c_needs_copy = not c_tensor.is_contiguous()
+            if c_needs_copy:
+                c_buf = torch.empty_like(c_tensor)
+            else:
+                c_buf = c_tensor
+
+            # Reshape to [1, M, K], [1, N, K], [1, M, N] for the batched kernel
+            a_batched = a_tensor.unsqueeze(0)  # [1, M, K]
+            b_batched = b_tensor.unsqueeze(0)  # [1, N, K]
+            # c_buf is [M, N], permute to [M, N, 1] for cute layout
+            c_tmp = c_buf.unsqueeze(-1)  # [M, N, 1]
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    a_batched.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    b_batched.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tmp).mark_layout_dynamic(leading_dim=1)
+
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        a_batched.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        b_batched.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_cute_tensor,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_batched.data_ptr(),
+                    b_batched.data_ptr(),
+                    c_tmp,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_cute_tensor,
+                    stream=stream,
+                )
+
+            # Copy result back if original output was non-contiguous
+            if c_needs_copy:
+                c_tensor.copy_(c_buf)
+
+    # input: [M, K], weight: [N, K], output: [M, N]
+    @torch.library.custom_op("trtllm::cute_dsl_bf16_gemm_blackwell",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_bf16_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """
+        CuTe DSL BF16 GEMM for Linear layers on Blackwell.
+
+        Computes: output = input @ weight^T
+        - input: [M, K] (num_tokens, in_features)
+        - weight: [N, K] (out_features, in_features)
+        - output: [M, N] (num_tokens, out_features)
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL BF16 GEMM only supports SM 100 family.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLBf16BlackwellGemmRunner(use_tvm_ffi=use_tvm_ffi)
+
+        inputs = [input, weight, output]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_bf16_gemm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_bf16_gemm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        m, k = mat_a.shape[0], mat_a.shape[1]
+        n = mat_b.shape[0]
+        assert output.dtype == torch.bfloat16, "CuTe DSL bf16 gemm output dtype must be bf16"
+        assert output.shape == (m, n), "CuTe DSL bf16 gemm output shape is incorrect"
