@@ -4520,10 +4520,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 return []
 
-            # input: [M, K], weight: [N, K]
+            # input: [M, K], weight: [N, K], output: [M, N]
             m, k = inputs[0].shape[0], inputs[0].shape[1]
             n = inputs[1].shape[0]
             batch_size = 1
+
+            # Detect output dtype from the output tensor (supports BF16 and FP32)
+            c_dtype_cutlass = _TORCH_TO_CUTLASS_DTYPE[inputs[2].dtype]
 
             # Layouts: A is [M, K] K-major, B is [N, K] K-major
             a_major = "k"
@@ -4551,7 +4554,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if self.__class__.kernel_class.can_implement(
                     cutlass.BFloat16,  # ab_dtype
                     cutlass.Float32,  # acc_dtype
-                    cutlass.BFloat16,  # c_dtype
+                    c_dtype_cutlass,  # c_dtype
                     use_2cta_instrs,
                     mma_tiler_mn,
                     cluster_shape_mn,
@@ -4577,7 +4580,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 inputs (List[torch.Tensor]):
                     inputs[0]: Input tensor of shape (m, k), dtype: bf16.
                     inputs[1]: Weight tensor of shape (n, k), dtype: bf16.
-                    inputs[2]: Output tensor of shape (m, n), dtype: bf16.
+                    inputs[2]: Output tensor of shape (m, n), dtype: bf16 or fp32.
                 tactic: Tiling and cluster strategy, typically a tuple
                     (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
             """
@@ -4614,6 +4617,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # c_buf is [M, N], permute to [M, N, 1] for cute layout
             c_tmp = c_buf.unsqueeze(-1)  # [M, N, 1]
 
+            # Detect output dtype (supports BF16 and FP32)
+            c_dtype_cutlass = _TORCH_TO_CUTLASS_DTYPE[c_tensor.dtype]
+
             if not self.use_tvm_ffi:
                 a_ptr = make_ptr(
                     cutlass.BFloat16,
@@ -4637,6 +4643,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn,
                 cluster_shape_mn,
                 self.use_tvm_ffi,
+                c_dtype_cutlass,
             )
             if cache_key not in self.__class__.kernel_cache:
                 if self.use_tvm_ffi:
@@ -4758,5 +4765,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         m, k = mat_a.shape[0], mat_a.shape[1]
         n = mat_b.shape[0]
-        assert output.dtype == torch.bfloat16, "CuTe DSL bf16 gemm output dtype must be bf16"
+        assert output.dtype in (torch.bfloat16, torch.float32), \
+            "CuTe DSL bf16 gemm output dtype must be bf16 or fp32"
         assert output.shape == (m, n), "CuTe DSL bf16 gemm output shape is incorrect"
