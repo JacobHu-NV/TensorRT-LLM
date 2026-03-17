@@ -1010,3 +1010,62 @@ class PersistentDenseGemmKernel:
             max_active_clusters,
             stream,
         )
+
+    @cute.jit
+    def wrapper_strided(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
+        a_stride_m: cutlass.Int32,
+        a_stride_batch: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Executes the GEMM kernel with explicit A tensor strides.
+
+        Like ``wrapper`` but allows non-contiguous A tensors by accepting
+        the M and batch strides directly.  The K stride is assumed to be 1
+        (row-major in K).  B is always contiguous.
+
+        Args:
+            m: The M dimension of the GEMM problem.
+            n: The N dimension of the GEMM problem.
+            k: The K dimension of the GEMM problem.
+            batch_size: The batch dimension.
+            a_ptr: Pointer to the A tensor data.
+            b_ptr: Pointer to the B tensor data.
+            c_tensor: Output tensor as cute.Tensor.
+            a_stride_m: Stride of A along the M dimension (in elements).
+            a_stride_batch: Stride of A along the batch dimension (in elements).
+            max_active_clusters: Maximum number of active clusters.
+            stream: CUDA stream for the operation.
+        """
+        # A with explicit strides: (M, K, batch_size), K stride = 1
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_layout(
+                (m, k, batch_size),
+                stride=(a_stride_m, 1, a_stride_batch),
+            ),
+        )
+        # B is always contiguous: (N, K, batch_size) with K innermost
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout(
+                (n, k, batch_size),
+                order=(1, 0, 2),
+            ),
+        )
+
+        self(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            max_active_clusters,
+            stream,
+        )

@@ -4315,30 +4315,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             a_tensor, b_tensor, c_tensor = inputs
 
-            # Ensure A and B are contiguous — the kernel constructs CuTe
-            # layouts via make_ordered_layout assuming contiguous [B, M, K]
-            # and [B, N, K].  Transpose views (e.g. from .transpose(0,1))
-            # have swapped batch/seq strides which would cause the kernel
-            # to read from wrong memory locations.
-            a_tensor = a_tensor.contiguous()
-            b_tensor = b_tensor.contiguous()
-
-            # For the output, use a contiguous buffer so TMA store sees a
-            # standard layout; copy back afterwards if the original was
-            # non-contiguous.
-            c_needs_copy = not c_tensor.is_contiguous()
-            if c_needs_copy:
-                c_buf = torch.empty_like(c_tensor)
-            else:
-                c_buf = c_tensor
-
-            # c_buf is [B, M, N], permute to [M, N, B] for cute layout
-            c_tmp = c_buf.permute(1, 2, 0)
+            # Permute C from [B, M, N] to [M, N, B] for CuTe layout.
+            # from_dlpack captures the actual strides, so non-contiguous
+            # views (e.g. from .transpose(0,1)) are handled natively by
+            # TMA without an extra copy.
+            c_tmp = c_tensor.permute(1, 2, 0)
 
             batch_size = a_tensor.shape[0]
             m = a_tensor.shape[1]
             k = a_tensor.shape[2]
             n = b_tensor.shape[1]
+
+            # Compute A strides so the kernel can handle non-contiguous
+            # views (e.g. [M,B,K].transpose(0,1) → [B,M,K] with
+            # non-standard strides) without a .contiguous() copy.
+            # CuTe tensor is (M, K, B) so strides map as:
+            #   M stride  = a_tensor.stride(1)
+            #   K stride  = 1  (always innermost)
+            #   B stride  = a_tensor.stride(0)
+            a_stride_m = a_tensor.stride(1)
+            a_stride_batch = a_tensor.stride(0)
 
             if not self.use_tvm_ffi:
                 a_ptr = make_ptr(
@@ -4394,7 +4390,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 compiled_gemm = cute.compile(
-                    gemm.wrapper,
+                    gemm.wrapper_strided,
                     m,
                     n,
                     k,
@@ -4402,6 +4398,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_ptr,
                     b_ptr,
                     c_cute_tensor,
+                    a_stride_m,
+                    a_stride_batch,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
                     options=f"--opt-level 2 --enable-tvm-ffi"
@@ -4421,6 +4419,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_tensor.data_ptr(),
                     b_tensor.data_ptr(),
                     c_tmp,
+                    a_stride_m,
+                    a_stride_batch,
                 )
             else:
                 compiled_gemm(
@@ -4431,12 +4431,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_ptr,
                     b_ptr,
                     c_cute_tensor,
+                    a_stride_m,
+                    a_stride_batch,
                     stream=stream,
                 )
-
-            # Copy result back if original output was non-contiguous
-            if c_needs_copy:
-                c_tensor.copy_(c_buf)
 
     # a/b: bf16, output: bf16
     @torch.library.custom_op("trtllm::cute_dsl_bf16_bmm_blackwell",
