@@ -551,6 +551,11 @@ disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python[DeepSeek-V3-Lite-fp8]
 
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_bmm
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_bmm_4gpus
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm_4gpus
+
 # llm-api promote pytorch to default
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_tensorrt
