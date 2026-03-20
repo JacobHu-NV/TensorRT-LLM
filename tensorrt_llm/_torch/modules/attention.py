@@ -2330,8 +2330,8 @@ class MLA(nn.Module):
                     attn_output.transpose(0, 1))
             else:
                 torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                            self.v_b_proj.transpose(1, 2),
-                                            attn_output.transpose(0, 1))
+                                         self.v_b_proj.transpose(1, 2),
+                                         attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,

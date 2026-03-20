@@ -319,18 +319,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
+        PersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
         FilteredTopKKernelVarlenDecode
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
         STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
         SinglePassMultiCTARadixTopKKernel
+<<<<<<< HEAD
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
+=======
+>>>>>>> f6e66826d ([TRTLLM-11289][fix] Fix pre-commit formatting for CuTe DSL BF16 GEMM/BMM code)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -4218,11 +4223,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
 
-        tuning_config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(
-                0, 1, get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2), ),
-        )
+        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 1, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ), )
 
         def __init__(self, use_tvm_ffi: bool = True):
             super().__init__()
@@ -4242,8 +4245,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 return []
             # [b, m, k]
-            batch_size, m, k = inputs[0].shape[0], inputs[0].shape[
-                1], inputs[0].shape[2]
+            batch_size, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[
+                0].shape[2]
             # [b, n, k]
             n = inputs[1].shape[1]
             # m,k
@@ -4475,8 +4478,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
         n = mat_b.shape[1]
         assert output.dtype == torch.bfloat16, "CuTe DSL bf16 bmm output dtype must be bf16"
-        assert output.shape == (batch_size, m,
-                                n), "CuTe DSL bf16 bmm output shape is incorrect"
+        assert output.shape == (
+            batch_size, m, n), "CuTe DSL bf16 bmm output shape is incorrect"
 
     # ======================================================================
     # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
@@ -4494,11 +4497,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
 
-        tuning_config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(
-                0, 0, get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2), ),
-        )
+        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ), )
 
         def __init__(self, use_tvm_ffi: bool = True):
             super().__init__()
@@ -4765,4 +4766,5 @@ if IS_CUTLASS_DSL_AVAILABLE:
         n = mat_b.shape[0]
         assert output.dtype in (torch.bfloat16, torch.float32), \
             "CuTe DSL bf16 gemm output dtype must be bf16 or fp32"
-        assert output.shape == (m, n), "CuTe DSL bf16 gemm output shape is incorrect"
+        assert output.shape == (
+            m, n), "CuTe DSL bf16 gemm output shape is incorrect"

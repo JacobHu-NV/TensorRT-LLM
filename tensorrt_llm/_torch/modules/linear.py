@@ -477,7 +477,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             input_2d = input.view(-1, input.shape[-1])  # [M, K]
             m, k = input_2d.shape
             n = module.weight.shape[0]
-            output = torch.empty(m, n, dtype=torch.bfloat16, device=input.device)
+            output = torch.empty(m,
+                                 n,
+                                 dtype=torch.bfloat16,
+                                 device=input.device)
             torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
                 input_2d.contiguous(),
                 module.weight,

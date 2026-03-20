@@ -2088,7 +2088,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
                              ids=["tp4", "ep4"])
     def test_cute_dsl_bf16_bmm_4gpus(self, tp_size, pp_size, ep_size,
-                                      cuda_graph):
+                                     cuda_graph):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
@@ -2113,7 +2113,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
                              ids=["tp4", "ep4"])
     def test_cute_dsl_bf16_gemm_4gpus(self, tp_size, pp_size, ep_size,
-                                       cuda_graph):
+                                      cuda_graph):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
