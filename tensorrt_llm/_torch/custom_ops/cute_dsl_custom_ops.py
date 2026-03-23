@@ -327,15 +327,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
         SinglePassMultiCTARadixTopKKernel
-<<<<<<< HEAD
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
-=======
->>>>>>> f6e66826d ([TRTLLM-11289][fix] Fix pre-commit formatting for CuTe DSL BF16 GEMM/BMM code)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
