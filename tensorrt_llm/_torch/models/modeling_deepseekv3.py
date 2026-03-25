@@ -1817,7 +1817,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # at the end of __init__.
         if model_config.mapping.has_cp_helix():
             print(
-                f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
+                "[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
             # Repurpose KVP ranks to TP while keeping other details the same.
@@ -1880,8 +1880,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
             print(
-                f"[DeepseekV3ForCausalLM::__init__] Restoring original mapping."
-            )
+                "[DeepseekV3ForCausalLM::__init__] Restoring original mapping.")
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
