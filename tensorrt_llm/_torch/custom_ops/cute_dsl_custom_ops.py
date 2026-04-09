@@ -3371,9 +3371,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             detected = get_current_stream_gc_sm_count()
             if detected > 0:
                 sm_budget = detected
-                print(
-                    f"Auto-detected SM budget from GreenContext: {sm_budget} SMs"
-                )
+                # print(
+                #     f"Auto-detected SM budget from GreenContext: {sm_budget} SMs"
+                # )
 
         # unique_id() intentionally excludes sm_budget, so all GC splits share
         # the same autotuner cache entry.  The cache is pre-warmed once with
@@ -3410,7 +3410,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs,
         )
 
-        print(f"{best_tactic=}")
+        # print(f"{best_tactic=}")
 
         # Phase 2: execute with the SM budget reflecting the actual runtime
         # constraint (Green Context partition or unconstrained).
@@ -3582,14 +3582,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if key not in self.tuning_config_cache:
                 self.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2), ),
+                        0, 0, deep_gemm_gen_tuning_buckets), ),
                     constraint_specs=(
                         ConstraintSpec(2, 0, fp4_scale_infer_shape),
                         ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
                     ),
                     use_cold_l2_cache=True,
-                    tune_max_num_tokens=256,
+                    tune_max_num_tokens=512,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
@@ -5787,9 +5786,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             detected = get_current_stream_gc_sm_count()
             if detected > 0:
                 sm_budget = detected
-                print(
-                    f"Auto-detected SM budget from GreenContext: {sm_budget} SMs"
-                )
+                # print(
+                #     f"Auto-detected SM budget from GreenContext: {sm_budget} SMs"
+                # )
 
         # Tuning runner: unconstrained (all SMs).  unique_id() intentionally
         # excludes sm_budget so the autotuner cache is shared across all
@@ -5811,9 +5810,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs,
         )
 
-        print(
-            f"Chosen tactic for CuTe DSL BF16 GEMM: {best_tactic}, sm_budget={exec_runner.sm_budget}"
-        )
+        # print(
+        #     f"Chosen tactic for CuTe DSL BF16 GEMM: {best_tactic}, sm_budget={exec_runner.sm_budget}"
+        # )
 
         exec_runner(inputs, tactic=best_tactic)
 

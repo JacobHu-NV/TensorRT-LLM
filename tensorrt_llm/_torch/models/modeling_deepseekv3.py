@@ -577,6 +577,25 @@ class DeepseekV3WeightLoader:
                         "up_proj": "w3",
                         "gate_proj": "w1",
                     })
+                    # For DenseGEMM with fused shared expert: inject shared expert
+                    # weights as the last expert (index num_experts).
+                    grandparent_name = '.'.join(
+                        names[:-2])  # e.g. "model.layers.3.mlp"
+                    parent_mlp = all_named_modules.get(grandparent_name)
+                    if getattr(parent_mlp, '_fuse_shared_expert', False):
+                        shared_prefix = grandparent_name + ".shared_experts"
+                        shared_raw = filter_weights(shared_prefix, weights)
+                        shared_renamed = rename_moe_weight(
+                            shared_raw, {
+                                "down_proj": "w2",
+                                "up_proj": "w3",
+                                "gate_proj": "w1",
+                            })
+                        shared_idx = module.num_experts - 1
+                        for k, v in shared_renamed.items():
+                            module_weights[f"{shared_idx}.{k}"] = v
+                        if can_mark_consumed:
+                            weights.mark_consumed(shared_prefix)
                     module.load_weights(weights=[module_weights])
                     # Mark consumed MoE weights using parent name
                     if can_mark_consumed:
@@ -934,8 +953,17 @@ class Deepseekv3MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
+
+        # For DenseGEMM, fuse the shared expert as the last expert in the dense
+        # GEMM kernel (index num_experts), always activated with scale=1.0.
+        # This avoids a separate GatedMLP forward and add operation.
+        self._fuse_shared_expert = model_config.moe_backend.upper(
+        ) == 'DENSEGEMM'
+        self.num_routed_experts = num_experts
+        fused_num_experts = num_experts + 1 if self._fuse_shared_expert else num_experts
+
         self.experts = create_moe(
-            num_experts=num_experts,
+            num_experts=fused_num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -958,36 +986,42 @@ class Deepseekv3MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        shared_quant_config = self._get_shared_experts_quant_config(
-            model_config, layer_idx)
-        shared_model_config = model_config
-        if shared_quant_config is not model_config.quant_config:
-            shared_model_config = copy.copy(model_config)
-            shared_model_config.quant_config = shared_quant_config
+        if self._fuse_shared_expert:
+            # Shared expert is fused into self.experts; no separate module needed.
+            self.shared_experts = None
+            self.shared_output_scale = None
+            self.shared_experts_use_fp4 = False
+        else:
+            shared_quant_config = self._get_shared_experts_quant_config(
+                model_config, layer_idx)
+            shared_model_config = model_config
+            if shared_quant_config is not model_config.quant_config:
+                shared_model_config = copy.copy(model_config)
+                shared_model_config.quant_config = shared_quant_config
 
-        # For shared experts, use the block size implied by their quant config.
-        block_size = 1
-        if (shared_quant_config is not None
-                and shared_quant_config.quant_algo is not None
-                and shared_quant_config.group_size is not None):
-            block_size = shared_quant_config.group_size
+            # For shared experts, use the block size implied by their quant config.
+            block_size = 1
+            if (shared_quant_config is not None
+                    and shared_quant_config.quant_algo is not None
+                    and shared_quant_config.group_size is not None):
+                block_size = shared_quant_config.group_size
 
-        shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
-            shared_expert_intermediate_size, block_size)
+            shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
+                shared_expert_intermediate_size, block_size)
 
-        self.shared_experts = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=shared_expert_intermediate_size,
-            bias=False,
-            dtype=dtype,
-            config=shared_model_config,
-            overridden_tp_size=shared_tp_size,
-            reduce_output=False,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-        )
-        self.shared_experts_use_fp4 = (
-            shared_quant_config is not None
-            and shared_quant_config.layer_quant_mode.has_nvfp4())
+            self.shared_experts = GatedMLP(
+                hidden_size=hidden_size,
+                intermediate_size=shared_expert_intermediate_size,
+                bias=False,
+                dtype=dtype,
+                config=shared_model_config,
+                overridden_tp_size=shared_tp_size,
+                reduce_output=False,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            )
+            self.shared_experts_use_fp4 = (
+                shared_quant_config is not None
+                and shared_quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1131,9 +1165,20 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 device=hidden_states.device)
 
+        is_densegemm = self.gate.moe_backend.upper() == 'DENSEGEMM'
+        if is_densegemm:
+            # DenseGEMM handles routing and FP4 quantization internally.
+            # Pass BF16 hidden_states so quantize_input() works correctly, and
+            # provide router_weight_t for the internal routing GEMM.
+            expert_input = hidden_states
+            extra_kwargs = {"router_weight_t": self.gate.weight.t()}
+        else:
+            expert_input = (hidden_states_fp4
+                            if hidden_states_fp4 is not None else hidden_states)
+            extra_kwargs = {}
+
         routed_output = self.experts(
-            hidden_states_fp4
-            if hidden_states_fp4 is not None else hidden_states,
+            expert_input,
             router_logits,
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
@@ -1142,6 +1187,7 @@ class Deepseekv3MoE(nn.Module):
             **({
                 "alltoall_result_do_sum": False
             } if isinstance(self.experts, WideEPMoE) else {}),
+            **extra_kwargs,
         )
 
         return routed_output
@@ -1156,6 +1202,19 @@ class Deepseekv3MoE(nn.Module):
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
+
+        if self._fuse_shared_expert:
+            # Shared expert is fused into self.experts (DenseGEMM always-active
+            # expert at index num_routed_experts).  No separate forward needed.
+            final_hidden_states = self.compute_routed_output(
+                hidden_states, hidden_states_fp4, all_rank_num_tokens,
+                do_finalize)
+            if not self.use_dp and self.mapping.tp_size > 1:
+                final_hidden_states = self.allreduce(
+                    final_hidden_states,
+                    all_reduce_params=final_all_reduce_params)
+
+            return final_hidden_states
 
         def _compute_shared_output():
             shared_input = (hidden_states_fp4 if
