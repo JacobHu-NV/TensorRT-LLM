@@ -3,17 +3,34 @@
 
 import inspect
 import os
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
 
+from ...autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
 from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
+from ...utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    deep_gemm_tuning_buckets,
+    prev_deep_gemm_bucket,
+    swizzle_sf,
+    unswizzle_sf,
+)
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
@@ -78,6 +95,111 @@ def gen_fc2_alpha_fused(
         )
 
     return fc2_alpha.scatter_(1, token_selected_experts.long(), scaled_values)
+
+
+class DenseGEMMSMPSMRunner(TunableRunner):
+    """TunableRunner that sweeps the FC1 SM count for the SM-Partition overlap path.
+
+    Each tactic is an integer representing the requested SM count assigned to FC1.
+    The router partition receives the remaining SMs.  Unlike the GC variant, SM
+    isolation is enforced via soft sm_budget kernel hints rather than hardware
+    GreenContext partitions.
+    """
+
+    tuning_config_cache: dict = {}
+
+    def __init__(self, moe_layer: "DenseGEMMFusedMoE") -> None:
+        super().__init__()
+        self.moe = moe_layer
+
+    def unique_id(self):
+        moe = self.moe
+        return (
+            moe.num_experts,
+            moe.hidden_size,
+            moe.intermediate_size_per_partition,
+            moe.expert_size_per_partition,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        return list(self.moe._smp_sm_candidates)
+
+    def get_tuning_config(self) -> TuningConfig:
+        key = self.unique_id()
+        if key not in self.__class__.tuning_config_cache:
+            self.__class__.tuning_config_cache[key] = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        0,
+                        0,
+                        # Use the same fine-grained bucket grid as the inner
+                        # GEMM runners so that the outer sm-split tactic is
+                        # tuned at the same resolution as the inner tactics.
+                        deep_gemm_tuning_buckets,
+                        # Ceiling lookup: map actual num_tokens to the nearest
+                        # cached bucket >= x.
+                        prev_deep_gemm_bucket,
+                    ),
+                ),
+                constraint_specs=(
+                    # x_sf: shape[0] tracks num_tokens (pre-swizzle, 2-D)
+                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                    # router_input: shape[0] tracks num_tokens
+                    ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),
+                ),
+                use_cold_l2_cache=True,
+            )
+        return self.__class__.tuning_config_cache[key]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        x, x_sf, router_weight_t, router_input = inputs
+        num_tokens = x.shape[0]
+        candidates = self.moe._smp_sm_candidates
+        fc1_sms = tactic if tactic in candidates else candidates[0]
+        if do_preparation:
+            # Two-phase inner-runner warm-up before the outer CUDA-graph capture.
+            #
+            # Phase A — full-SM tuning (once, cheap in the outer dimension):
+            #   Call _warm_inner_runners_full_sm() with sm_budget=0 so the inner
+            #   autotuners profile all token-buckets once with the full hardware SM
+            #   count and cache the best tactic.  Because sm_budget is excluded from
+            #   all runners' unique_id(), this single entry is shared across every
+            #   fc1_sms split.
+            #
+            # Phase B — per-candidate kernel-compilation warm-up:
+            #   Iterate over all fc1_sms candidates. Since inner caches are warm,
+            #   choose_one() returns cached tactics without re-profiling. The only
+            #   work done is kernel compilation for each (sm_budget) combination.
+            try:
+                self.moe._warm_inner_runners_full_sm(x, x_sf, router_weight_t, router_input)
+            except Exception as e:
+                logger.warning(
+                    f"[DenseGEMMSMPSMRunner] full-SM inner warm-up failed, "
+                    f"num_tokens={num_tokens}: {e}"
+                )
+            for cand_fc1_sms in candidates:
+                try:
+                    self.moe._run_moe_nvfp4_smp_impl(
+                        x, x_sf, router_weight_t, router_input, cand_fc1_sms
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[DenseGEMMSMPSMRunner] preparation failed for "
+                        f"fc1_sms={cand_fc1_sms}, num_tokens={num_tokens}: {e}"
+                    )
+        return self.moe._run_moe_nvfp4_smp_impl(x, x_sf, router_weight_t, router_input, fc1_sms)
 
 
 class DenseGEMMFusedMoE(MoE):
@@ -216,7 +338,7 @@ class DenseGEMMFusedMoE(MoE):
 
         # Environment variable to control fc2_alpha fusion into FC1's alpha_post.
         # Default: disabled (0). Set to "1" to enable fusion (known accuracy issue under TP).
-        self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "0") == "1"
+        self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "1") == "1"
 
         # Pre-register fc2_alpha_max buffer for fused fc2_alpha optimization.
         # Populated in load_weights() with max(fc2_alpha).
@@ -235,6 +357,7 @@ class DenseGEMMFusedMoE(MoE):
         # Default: 0.5 (50% of total SMs).
         device_id = torch.cuda.current_device()
         num_sms = torch.cuda.get_device_properties(device_id).multi_processor_count
+        self.num_sms = num_sms
         _fc1_sm_config = float(os.environ.get("TRTLLM_MOE_FC1_SM_NUNBER", 0.5))
         if _fc1_sm_config > 1:
             fc1_sms_raw = int(_fc1_sm_config)
@@ -242,6 +365,15 @@ class DenseGEMMFusedMoE(MoE):
             fc1_sms_raw = int(num_sms * _fc1_sm_config)
         self.fc1_sms = max(1, fc1_sms_raw)
         self.router_sms = max(1, num_sms - self.fc1_sms)
+
+        # Build SM-split candidates for the autotuner (non-fused path only).
+        # Sweep fc1_sms from 108 to num_sms (exclusive) with step 8.
+        # Step 8 matches smCoscheduledAlignment on Blackwell so every candidate
+        # maps to a distinct SM partition boundary; non-aligned values would be
+        # rounded to the same partition, producing duplicate candidates.
+        _alignment = 8  # smCoscheduledAlignment on Blackwell (SM100/SM103)
+        _start = 108  # first sensible fc1_sms (leaves at least 1 SM for Router)
+        self._smp_sm_candidates = sorted(range(_start, num_sms, _alignment))
 
         # Initialize auxiliary stream and events for gen_fc2_alpha_fused overlap with fc1.
         # Use regular stream with priority=-1 (no GreenContext).
@@ -388,6 +520,202 @@ class DenseGEMMFusedMoE(MoE):
 
         return x, x_sf
 
+    def _warm_inner_runners_full_sm(
+        self,
+        x: torch.Tensor,
+        x_sf: torch.Tensor,
+        router_weight_t: torch.Tensor,
+        router_input: torch.Tensor,
+    ) -> None:
+        """Warm FC1, Router GEMM, and FC2 autotuner caches with the full SM budget.
+
+        This must be called once before the outer profiling loop in
+        DenseGEMMSMPSMRunner.do_preparation.  Because sm_budget is excluded from
+        all inner runners' unique_id(), a single full-SM tuning pass populates
+        the shared cache entry used by every SM split.  Subsequent calls with
+        any sm_budget find a cache hit and skip profiling entirely, reducing the
+        total tune cost from O(S × inner) to O(inner + S).
+
+        FC2 is explicitly autotuned here using the fc1_output produced by the
+        full-SM FC1 run, so that CuteDSLNVFP4DenseGemmFC2Runner's cache is warm
+        before the per-candidate Phase B loop and before any CUDA-graph capture
+        (cute.compile() is not graph-safe).
+
+        Args:
+            x: NVFP4-quantised activations (packed), unswizzled x_sf expected.
+            x_sf: Unswizzled scale factors for x (2-D: [num_tokens, hidden/16]).
+            router_weight_t: Router weight matrix [hidden, num_experts].
+            router_input: BF16 input to the router GEMM [num_tokens, hidden].
+        """
+        num_tokens = x.shape[0]
+        # swizzle_sf is normally applied inside _run_moe_nvfp4_smp_impl; do it
+        # here because we are calling the FC1 op directly.
+        x_sf_swizzled = swizzle_sf(x_sf, num_tokens, self.hidden_size)
+
+        # FC1: sm_budget=0 → unconstrained (full SM).
+        fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+            x,
+            self.w3_w1_weight.view(torch.uint8),
+            x_sf_swizzled,
+            self.w3_w1_weight_scale,
+            self.fc31_alpha,
+            None,  # alpha_post: not needed for cache warm-up
+            self.fc2_input_scale,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=2 * self.intermediate_size_per_partition,
+            output_dtype=torch.float4_e2m1fn_x2,
+            scaling_vector_size=self.scaling_vector_size,
+            sm_budget=0,  # full SM: sm_budget <= 0 → max_active_clusters_hw
+        )
+
+        # Router GEMM: sm_budget=0 → unconstrained (full SM).
+        m, n = router_input.shape[0], router_weight_t.shape[1]
+        router_logits = torch.empty(m, n, dtype=torch.float32, device=router_input.device)
+        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+            router_input.contiguous(),
+            router_weight_t.t().contiguous(),
+            router_logits,
+            sm_budget=0,  # full SM
+        )
+
+        # FC2: explicitly autotune with full SM.
+        # Use dummy fc2_alpha (all-ones) since only the shape matters for tiling.
+        _dummy_fc2_alpha = torch.ones(
+            [num_tokens, self.expert_size_per_partition],
+            dtype=torch.float32,
+            device=x.device,
+        )
+        torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+            fc1_output,
+            self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
+            fc1_output_sf.reshape(-1),
+            self.w2_weight_scale,
+            _dummy_fc2_alpha,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=self.intermediate_size_per_partition,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=self.scaling_vector_size,
+        )
+
+    def _run_moe_nvfp4_smp_impl(
+        self,
+        x: torch.Tensor,
+        x_sf: torch.Tensor,
+        router_weight_t: torch.Tensor,
+        router_input: torch.Tensor,
+        fc1_sms: int,
+    ) -> torch.Tensor:
+        """Execute the SMP overlap path with the given FC1 SM budget.
+
+        Args:
+            x: NVFP4-quantised activations (already packed).
+            x_sf: Unswizzled scaling factors for ``x``.
+            router_weight_t: Router weight matrix ``[hidden, num_experts]``.
+            router_input: Input fed to the router GEMM ``[num_tokens, hidden_size]``.
+            fc1_sms: Requested SM count for FC1 (soft budget via sm_budget hint).
+                     The router receives ``num_sms - fc1_sms`` SMs.
+
+        Returns:
+            ``final_hidden_states`` tensor of shape ``[num_tokens, hidden_size]``.
+        """
+        router_sms = max(1, self.num_sms - fc1_sms)
+        num_tokens = x.shape[0]
+
+        x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
+
+        capture_graph = torch.cuda.is_current_stream_capturing()
+        fc2_alpha_buffer = DenseGEMMFusedMoE.buffers.get_buffer(
+            (num_tokens, self.expert_size_per_partition),
+            dtype=torch.float32,
+            buffer_name="fc2_alpha",
+            reserve_buffer=capture_graph,
+        )
+
+        # Record dependency so the aux stream sees consistent inputs.
+        self.event_dict[EventType.Main].record()
+
+        # Step 1: launch Router GEMM on the aux stream.
+        with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
+            self.event_dict[EventType.Main].wait()
+            m, n = router_input.shape[0], router_weight_t.shape[1]
+            router_logits = torch.empty(m, n, dtype=torch.float32, device=router_input.device)
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+                router_input.contiguous(),
+                router_weight_t.t().contiguous(),
+                router_logits,
+                sm_budget=router_sms,
+            )
+            token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
+            token_selected_experts = token_selected_experts.to(torch.int32)
+            # Append fused shared experts (always active, scale=1.0) if any.
+            num_routing_experts = router_weight_t.shape[1]
+            if self.expert_size_per_partition > num_routing_experts:
+                n_shared = self.expert_size_per_partition - num_routing_experts
+                M_tok = router_input.shape[0]
+                shared_ids = (
+                    torch.arange(
+                        num_routing_experts,
+                        self.expert_size_per_partition,
+                        dtype=torch.int32,
+                        device=x.device,
+                    )
+                    .unsqueeze(0)
+                    .expand(M_tok, n_shared)
+                )
+                shared_scales = torch.ones(M_tok, n_shared, dtype=torch.float32, device=x.device)
+                token_selected_experts = torch.cat([token_selected_experts, shared_ids], dim=1)
+                token_final_scales = torch.cat([token_final_scales, shared_scales], dim=1)
+            fc2_alpha = gen_fc2_alpha_fused(
+                token_selected_experts,
+                token_final_scales,
+                self.fc2_alpha,
+                output=fc2_alpha_buffer,
+            )
+            self.event_dict[EventType.MoeFc2Alpha].record()
+
+        # Step 2: launch FC1 on the main stream.
+        # Dynamic: no sm_budget — CLC scheduler fills all available SMs.
+        # Static: sm_budget=fc1_sms — soft cap leaving room for router GEMM.
+        _fc1_op = (
+            torch.ops.trtllm.cute_dsl_nvfp4_dynamic_dense_gemm_swiglu_blackwell
+            if self.use_dynamic_fc1
+            else torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell
+        )
+        fc1_kwargs = dict(
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=2 * self.intermediate_size_per_partition,
+            output_dtype=torch.float4_e2m1fn_x2,
+            scaling_vector_size=self.scaling_vector_size,
+        )
+        if not self.use_dynamic_fc1:
+            fc1_kwargs["sm_budget"] = fc1_sms
+        fc1_output, fc1_output_sf = _fc1_op(
+            x,
+            self.w3_w1_weight.view(torch.uint8),
+            x_sf,
+            self.w3_w1_weight_scale,
+            self.fc31_alpha,
+            None,  # alpha_post: no post-SwiGLU scaling
+            self.fc2_input_scale,
+            **fc1_kwargs,
+        )
+
+        self.event_dict[EventType.MoeFc2Alpha].wait()
+
+        # FC2: input k = expert_count * intermediate_size (after SwiGLU)
+        final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+            fc1_output,
+            self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
+            fc1_output_sf.reshape(-1),
+            self.w2_weight_scale,
+            fc2_alpha,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=self.intermediate_size_per_partition,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=self.scaling_vector_size,
+        )
+        return final_hidden_states
+
     def run_moe_nvfp4(
         self,
         x: torch.Tensor,
@@ -436,17 +764,16 @@ class DenseGEMMFusedMoE(MoE):
 
         num_tokens = x.shape[0]
 
-        # Get pre-allocated buffer for fc2_alpha (CUDA graph compatible)
-        capture_graph = torch.cuda.is_current_stream_capturing()
-        fc2_alpha_buffer = DenseGEMMFusedMoE.buffers.get_buffer(
-            (num_tokens, self.expert_size_per_partition),
-            dtype=torch.float32,
-            buffer_name="fc2_alpha",
-            reserve_buffer=capture_graph,
-        )
-
         if self.use_fused_fc2_alpha:
             # Fused path: router GEMM runs on main stream before FC1.
+            # Get pre-allocated buffer for fc2_alpha (CUDA graph compatible)
+            capture_graph = torch.cuda.is_current_stream_capturing()
+            fc2_alpha_buffer = DenseGEMMFusedMoE.buffers.get_buffer(
+                (num_tokens, self.expert_size_per_partition),
+                dtype=torch.float32,
+                buffer_name="fc2_alpha",
+                reserve_buffer=capture_graph,
+            )
             m, n = router_input.shape[0], router_weight_t.shape[1]
             router_logits = torch.empty(m, n, dtype=torch.float32, device=router_input.device)
             torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
@@ -518,108 +845,22 @@ class DenseGEMMFusedMoE(MoE):
                 allowed_backends="cutlass,cublaslt,cutedsl,cuda_core",
             )
         else:
-            # SM Partition implementation: per-token per-expert fc2_alpha in FC2.
-            #
-            # Launch order:
-            #   1. Router GEMM fires first on the aux stream so that routing
-            #      work is in-flight before FC1 starts.
-            #   2. FC1 launches on the main stream immediately after.
-            #
-            # Static path: router_sms + fc1_sms together cover the full GPU,
-            #   so both kernels overlap spatially via soft SM budgets.
-            # Dynamic path (use_dynamic_fc1=True): FC1 uses the CLC scheduler
-            #   and is launched without an sm_budget cap so it can saturate all
-            #   available SMs.  Router GEMM still runs with router_sms on the
-            #   aux stream; the CLC will reclaim SMs as the router frees them.
-            x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
-
-            # Record dependency so the aux stream sees consistent inputs.
-            self.event_dict[EventType.Main].record()
-
-            # Step 1: launch Router GEMM on the aux stream.
-            with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
-                self.event_dict[EventType.Main].wait()
-                m, n = router_input.shape[0], router_weight_t.shape[1]
-                router_logits = torch.empty(m, n, dtype=torch.float32, device=router_input.device)
-                torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
-                    router_input.contiguous(),
-                    router_weight_t.t().contiguous(),
-                    router_logits,
-                    sm_budget=self.router_sms,
-                )
-                token_selected_experts, token_final_scales = self.routing_method.apply(
-                    router_logits
-                )
-                token_selected_experts = token_selected_experts.to(torch.int32)
-                # Append fused shared experts (always active, scale=1.0) if any.
-                num_routing_experts = router_weight_t.shape[1]
-                if self.expert_size_per_partition > num_routing_experts:
-                    n_shared = self.expert_size_per_partition - num_routing_experts
-                    M_tok = router_input.shape[0]
-                    shared_ids = (
-                        torch.arange(
-                            num_routing_experts,
-                            self.expert_size_per_partition,
-                            dtype=torch.int32,
-                            device=x.device,
-                        )
-                        .unsqueeze(0)
-                        .expand(M_tok, n_shared)
-                    )
-                    shared_scales = torch.ones(
-                        M_tok, n_shared, dtype=torch.float32, device=x.device
-                    )
-                    token_selected_experts = torch.cat([token_selected_experts, shared_ids], dim=1)
-                    token_final_scales = torch.cat([token_final_scales, shared_scales], dim=1)
-                fc2_alpha = gen_fc2_alpha_fused(
-                    token_selected_experts,
-                    token_final_scales,
-                    self.fc2_alpha,
-                    output=fc2_alpha_buffer,
-                )
-                self.event_dict[EventType.MoeFc2Alpha].record()
-
-            # Step 2: launch FC1 on the main stream.
-            # Dynamic: no sm_budget — CLC scheduler fills all available SMs.
-            # Static: sm_budget=fc1_sms — soft cap leaving room for router GEMM.
-            _fc1_op = (
-                torch.ops.trtllm.cute_dsl_nvfp4_dynamic_dense_gemm_swiglu_blackwell
-                if self.use_dynamic_fc1
-                else torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell
-            )
-            fc1_kwargs = dict(
-                expert_count=self.expert_size_per_partition,
-                weight_per_expert=2 * self.intermediate_size_per_partition,
-                output_dtype=torch.float4_e2m1fn_x2,
-                scaling_vector_size=self.scaling_vector_size,
-            )
-            if not self.use_dynamic_fc1:
-                fc1_kwargs["sm_budget"] = self.fc1_sms
-            fc1_output, fc1_output_sf = _fc1_op(
-                x,
-                self.w3_w1_weight.view(torch.uint8),
-                x_sf,
-                self.w3_w1_weight_scale,
-                self.fc31_alpha,
-                None,  # alpha_post: no post-SwiGLU scaling
-                self.fc2_input_scale,
-                **fc1_kwargs,
+            # SM Partition path: use AutoTuner to find the optimal FC1 SM split.
+            # Pass unswizzled x_sf so the constraint spec (shape[0] == num_tokens)
+            # remains valid; swizzle_sf is applied inside _run_moe_nvfp4_smp_impl.
+            tuner = AutoTuner.get()
+            runner = DenseGEMMSMPSMRunner(self)
+            inputs = [x, x_sf, router_weight_t, router_input]
+            _, best_tactic = tuner.choose_one(
+                "DenseGEMMFusedMoE::run_moe_nvfp4_smp",
+                [runner],
+                runner.get_tuning_config(),
+                inputs,
             )
 
-            self.event_dict[EventType.MoeFc2Alpha].wait()
+            print(f"best_tactic: {best_tactic}")
 
-            # FC2: input k = expert_count * intermediate_size (after SwiGLU)
-            final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
-                fc1_output,
-                self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
-                fc1_output_sf.reshape(-1),
-                self.w2_weight_scale,
-                fc2_alpha,
-                expert_count=self.expert_size_per_partition,
-                weight_per_expert=self.intermediate_size_per_partition,
-                output_dtype=torch.bfloat16,
-                scaling_vector_size=self.scaling_vector_size,
-            )
+            final_hidden_states = runner(inputs, tactic=best_tactic)
 
         return final_hidden_states
 

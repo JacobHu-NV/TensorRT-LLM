@@ -204,7 +204,7 @@ class NoOverlapDenseGEMMFusedMoE(MoE):
 
         # Environment variable to control fc2_alpha fusion into FC1's alpha_post.
         # Default: disabled (0). Set to "1" to enable fusion (known accuracy issue under TP).
-        self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "0") == "1"
+        self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "1") == "1"
 
         # Pre-register fc2_alpha_max buffer for fused fc2_alpha optimization.
         # Populated in load_weights() with max(fc2_alpha).

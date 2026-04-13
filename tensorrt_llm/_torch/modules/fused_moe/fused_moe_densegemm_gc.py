@@ -147,10 +147,10 @@ class DenseGEMMGCSMRunner(TunableRunner):
                         # GEMM runners so that the outer sm-split tactic is
                         # tuned at the same resolution as the inner tactics.
                         deep_gemm_tuning_buckets,
-                        # Floor lookup: map actual num_tokens to the largest
-                        # cached bucket strictly smaller than x.  This ensures
-                        # the cached tactic was profiled with fewer tokens than
-                        # the actual workload (conservative choice).
+                        # Ceiling lookup: map actual num_tokens to the nearest
+                        # cached bucket >= x.  This ensures the cached tactic
+                        # was profiled with at least as many tokens, giving
+                        # better SM utilisation for persistent GEMM kernels.
                         prev_deep_gemm_bucket,
                     ),
                 ),
@@ -183,10 +183,14 @@ class DenseGEMMGCSMRunner(TunableRunner):
             #
             # Phase A — full-SM tuning (once, cheap in the outer dimension):
             #   Call _warm_inner_runners_full_sm() with sm_budget=0 so the inner
-            #   autotuners (CuteDSLNVFP4DenseGemmSwigluRunner and
-            #   CuteDSLBf16BlackwellGemmRunner) profile all token-buckets once
-            #   with the full hardware SM count and cache the best tactic.
-            #   Because sm_budget is excluded from both runners' unique_id(), this
+            #   autotuners (CuteDSLNVFP4DenseGemmSwigluRunner,
+            #   CuteDSLBf16BlackwellGemmRunner, and CuteDSLNVFP4DenseGemmFC2Runner)
+            #   profile all token-buckets once with the full hardware SM count and
+            #   cache the best tactic.  FC2 is also warmed here using the fc1_output
+            #   produced by the full-SM FC1 run so that its autotuner cache is
+            #   populated before the per-candidate Phase B loop and before any
+            #   CUDA-graph capture (cute.compile() is not graph-safe).
+            #   Because sm_budget is excluded from all runners' unique_id(), this
             #   single entry is shared across every fc1_sms split.
             #
             # Phase B — per-candidate kernel-compilation warm-up (S passes, fast):
@@ -207,7 +211,7 @@ class DenseGEMMGCSMRunner(TunableRunner):
                 self.moe._warm_inner_runners_full_sm(x, x_sf, router_weight_t, router_input)
             except Exception as e:
                 logger.warning(
-                    f"[DenseGEMMGCSMRunner] full-SM inner warm-up failed, "
+                    f"[DenseGEMMGCSMRunner] full-SM inner warm-up (FC1/Router/FC2) failed, "
                     f"num_tokens={num_tokens}: {e}"
                 )
 
@@ -377,7 +381,7 @@ class DenseGEMMFusedMoE(MoE):
 
         # Environment variable to control fc2_alpha fusion into FC1's alpha_post.
         # Default: disabled (0). Set to "1" to enable fusion (known accuracy issue under TP).
-        self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "0") == "1"
+        self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "1") == "1"
 
         # Pre-register fc2_alpha_max buffer for fused fc2_alpha optimization.
         # Populated in load_weights() with max(fc2_alpha).
@@ -386,7 +390,7 @@ class DenseGEMMFusedMoE(MoE):
         device_id = torch.cuda.current_device()
         num_sms = torch.cuda.get_device_properties(device_id).multi_processor_count
         self.num_sms = num_sms
-        print(f"DenseGEMMFusedMoE initializing on device {device_id} with {num_sms} SMs")
+        # print(f"DenseGEMMFusedMoE initializing on device {device_id} with {num_sms} SMs")
 
         # Initialize GreenContext SM partitions and events for FC1/Router overlap.
         # Each GreenContext provides hardware-level SM isolation so that FC1 and
@@ -745,6 +749,9 @@ class DenseGEMMFusedMoE(MoE):
                 runner.get_tuning_config(),
                 inputs,
             )
+
+            print(f"best_tactic: {best_tactic}")
+
             final_hidden_states = runner(inputs, tactic=best_tactic)
 
         return final_hidden_states
@@ -756,14 +763,19 @@ class DenseGEMMFusedMoE(MoE):
         router_weight_t: torch.Tensor,
         router_input: torch.Tensor,
     ) -> None:
-        """Warm FC1 and Router GEMM autotuner caches with the full SM budget.
+        """Warm FC1, Router GEMM, and FC2 autotuner caches with the full SM budget.
 
         This must be called once before the outer profiling loop in
         DenseGEMMGCSMRunner.do_preparation.  Because sm_budget is excluded from
-        both inner runners' unique_id(), a single full-SM tuning pass populates
+        all inner runners' unique_id(), a single full-SM tuning pass populates
         the shared cache entry used by every GC SM split.  Subsequent calls with
         any sm_budget find a cache hit and skip profiling entirely, reducing the
         total tune cost from O(S × inner) to O(inner + S).
+
+        FC2 is explicitly autotuned here using the fc1_output produced by the
+        full-SM FC1 run, so that CuteDSLNVFP4DenseGemmFC2Runner's cache is warm
+        before the per-candidate Phase B loop and before any CUDA-graph capture
+        (cute.compile() is not graph-safe).
 
         Args:
             x: NVFP4-quantised activations (packed), unswizzled x_sf expected.
@@ -777,7 +789,8 @@ class DenseGEMMFusedMoE(MoE):
         x_sf_swizzled = swizzle_sf(x_sf, num_tokens, self.hidden_size)
 
         # FC1: sm_budget=0 → unconstrained (bypasses GC auto-detect, full SM).
-        torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+        # Capture outputs so they can be fed directly into the FC2 warm-up below.
+        fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
             x,
             self.w3_w1_weight.view(torch.uint8),
             x_sf_swizzled,
@@ -801,6 +814,26 @@ class DenseGEMMFusedMoE(MoE):
             router_weight_t.t().contiguous(),
             router_logits,
             sm_budget=0,  # full SM
+        )
+
+        # FC2: explicitly autotune CuteDSLNVFP4DenseGemmFC2Runner with full SM.
+        # Use dummy fc2_alpha (all-ones) since only the shape matters for tiling;
+        # actual scale values do not affect which tactic is selected.
+        _dummy_fc2_alpha = torch.ones(
+            [num_tokens, self.expert_size_per_partition],
+            dtype=torch.float32,
+            device=x.device,
+        )
+        torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+            fc1_output,
+            self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
+            fc1_output_sf.reshape(-1),
+            self.w2_weight_scale,
+            _dummy_fc2_alpha,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=self.intermediate_size_per_partition,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=self.scaling_vector_size,
         )
 
     def _run_moe_nvfp4_gc_impl(
@@ -896,6 +929,7 @@ class DenseGEMMFusedMoE(MoE):
                 shared_scales = torch.ones(M_tok, n_shared, dtype=torch.float32, device=x.device)
                 token_selected_experts = torch.cat([token_selected_experts, shared_ids], dim=1)
                 token_final_scales = torch.cat([token_final_scales, shared_scales], dim=1)
+
             fc2_alpha = gen_fc2_alpha_fused(
                 token_selected_experts,
                 token_final_scales,
