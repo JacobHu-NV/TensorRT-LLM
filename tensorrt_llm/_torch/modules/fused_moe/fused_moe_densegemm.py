@@ -18,7 +18,7 @@ Set ``TRTLLM_MOE_SM_SPLIT_MODE`` to one of the above values to select the backen
 
 import os
 
-_mode = os.environ.get("TRTLLM_MOE_SM_SPLIT_MODE", "gc").strip().lower()
+_mode = os.environ.get("TRTLLM_MOE_SM_SPLIT_MODE", "smp").strip().lower()
 
 if _mode == "smp":
     from .fused_moe_densegemm_smp import DenseGEMMFusedMoE

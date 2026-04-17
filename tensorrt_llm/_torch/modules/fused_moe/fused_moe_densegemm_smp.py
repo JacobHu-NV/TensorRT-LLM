@@ -344,13 +344,6 @@ class DenseGEMMFusedMoE(MoE):
         # Populated in load_weights() with max(fc2_alpha).
         self.register_buffer("fc2_alpha_max", torch.zeros(1, dtype=torch.float32))
 
-        # Whether to use the CLC dynamic tile scheduler for FC1.
-        # TRTLLM_MOE_FC1_DYNAMIC_SCHED=1 uses Sm100BlockScaledDynamicDenseGemmKernel
-        # (fc1_dynamic_sched.py) which launches a full-problem grid and lets the CLC
-        # hardware dispatch tiles to newly freed SMs automatically.
-        # Default: disabled (0).
-        self.use_dynamic_fc1 = os.environ.get("TRTLLM_MOE_FC1_DYNAMIC_SCHED", "0") == "1"
-
         # SM budget for FC1 and router kernels (SM-based, not cluster-based).
         # TRTLLM_MOE_FC1_SM_NUNBER: controls SM count for FC1 GEMM.
         # If > 1, treated as an absolute SM count; if <= 1, treated as a fraction of total SMs.
@@ -371,7 +364,7 @@ class DenseGEMMFusedMoE(MoE):
         # Step 8 matches smCoscheduledAlignment on Blackwell so every candidate
         # maps to a distinct SM partition boundary; non-aligned values would be
         # rounded to the same partition, producing duplicate candidates.
-        _alignment = 8  # smCoscheduledAlignment on Blackwell (SM100/SM103)
+        _alignment = 4  # smCoscheduledAlignment on Blackwell (SM100/SM103)
         _start = 108  # first sensible fc1_sms (leaves at least 1 SM for Router)
         self._smp_sm_candidates = sorted(range(_start, num_sms, _alignment))
 
@@ -634,7 +627,23 @@ class DenseGEMMFusedMoE(MoE):
         # Record dependency so the aux stream sees consistent inputs.
         self.event_dict[EventType.Main].record()
 
-        # Step 1: launch Router GEMM on the aux stream.
+        # Step 1: launch FC1 on the main stream with soft SM budget.
+        fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+            x,
+            self.w3_w1_weight.view(torch.uint8),
+            x_sf,
+            self.w3_w1_weight_scale,
+            self.fc31_alpha,
+            None,  # alpha_post: no post-SwiGLU scaling
+            self.fc2_input_scale,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=2 * self.intermediate_size_per_partition,
+            output_dtype=torch.float4_e2m1fn_x2,
+            scaling_vector_size=self.scaling_vector_size,
+            sm_budget=fc1_sms,
+        )
+
+        # Step 2: launch Router flow on the aux stream.
         with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
             self.event_dict[EventType.Main].wait()
             m, n = router_input.shape[0], router_weight_t.shape[1]
@@ -672,33 +681,6 @@ class DenseGEMMFusedMoE(MoE):
                 output=fc2_alpha_buffer,
             )
             self.event_dict[EventType.MoeFc2Alpha].record()
-
-        # Step 2: launch FC1 on the main stream.
-        # Dynamic: no sm_budget — CLC scheduler fills all available SMs.
-        # Static: sm_budget=fc1_sms — soft cap leaving room for router GEMM.
-        _fc1_op = (
-            torch.ops.trtllm.cute_dsl_nvfp4_dynamic_dense_gemm_swiglu_blackwell
-            if self.use_dynamic_fc1
-            else torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell
-        )
-        fc1_kwargs = dict(
-            expert_count=self.expert_size_per_partition,
-            weight_per_expert=2 * self.intermediate_size_per_partition,
-            output_dtype=torch.float4_e2m1fn_x2,
-            scaling_vector_size=self.scaling_vector_size,
-        )
-        if not self.use_dynamic_fc1:
-            fc1_kwargs["sm_budget"] = fc1_sms
-        fc1_output, fc1_output_sf = _fc1_op(
-            x,
-            self.w3_w1_weight.view(torch.uint8),
-            x_sf,
-            self.w3_w1_weight_scale,
-            self.fc31_alpha,
-            None,  # alpha_post: no post-SwiGLU scaling
-            self.fc2_input_scale,
-            **fc1_kwargs,
-        )
 
         self.event_dict[EventType.MoeFc2Alpha].wait()
 
