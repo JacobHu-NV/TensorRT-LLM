@@ -58,10 +58,42 @@ TACTICS = [
     ((128, 128), (1, 2)),
     ((128, 256), (1, 2)),
     ((128, 64), (1, 1)),
+    ((128, 64), (1, 4)),
     ((256, 128), (2, 1)),
+    ((256, 128), (2, 4)),
+    ((256, 128), (4, 2)),
 ]
 
+
+# mma_tiler_mn_candidates = [
+#     (128, 64),
+#     (256, 64),
+#     (128, 128),
+#     (256, 128),
+#     (128, 256),
+#     (256, 256),
+# ]
+
+# cluster_shape_mn_candidates = [
+#     (1, 1),
+#     (1, 2),
+#     (1, 4),
+#     (2, 1),
+#     (2, 2),
+#     (2, 4),
+#     (4, 1),
+#     (4, 2),
+#     (4, 4),
+# ]
+
+# TACTICS = [
+#     (mma, cluster)
+#     for mma in mma_tiler_mn_candidates
+#     for cluster in cluster_shape_mn_candidates
+# ]
+
 SPLIT_K_VALUES = [1, 2, 4]
+SWAP_AB_VALUES = [False, True]
 
 # Fixed problem dimensions (n, k, l)
 DEFAULT_NKL = (7168, 65536, 1)
@@ -82,14 +114,15 @@ def write_pivot_csv(rows, pivot_path):
             (r["mma_tiler_m"], r["mma_tiler_n"]),
             (r["cluster_m"], r["cluster_n"]),
             r["split_k"],
+            bool(r["swap_ab"]),
         )
         if key not in seen_keys:
             seen_keys.add(key)
             col_keys.append(key)
 
     def col_label(key):
-        mma, cluster, sk = key
-        return f"({mma[0]}, {mma[1]}),({cluster[0]}, {cluster[1]}),{sk}"
+        mma, cluster, sk, swap = key
+        return f"({mma[0]}, {mma[1]}),({cluster[0]}, {cluster[1]}),sk={sk},swap={int(swap)}"
 
     cell = {}
     for r in rows:
@@ -97,6 +130,7 @@ def write_pivot_csv(rows, pivot_path):
             (r["mma_tiler_m"], r["mma_tiler_n"]),
             (r["cluster_m"], r["cluster_n"]),
             r["split_k"],
+            bool(r["swap_ab"]),
         )
         cell[(r["m"], key)] = r["exec_time_us"] if r["status"] == "PASS" else ""
 
@@ -124,71 +158,76 @@ def sweep(nkl, expert_count, output_path, m_values=None):
     if m_values is None:
         m_values = M_VALUES
     rows = []
-    total = len(m_values) * len(TACTICS) * len(SPLIT_K_VALUES)
+    total = len(m_values) * len(TACTICS) * len(SPLIT_K_VALUES) * len(SWAP_AB_VALUES)
     done = 0
 
     for m in m_values:
         for mma_tiler_mn, cluster_shape_mn in TACTICS:
             for split_k in SPLIT_K_VALUES:
-                done += 1
-                tag = (
-                    f"m={m:4d}  tactic={mma_tiler_mn}/{cluster_shape_mn}"
-                    f"  split_k={split_k}  [{done}/{total}]"
-                )
-                try:
-                    with redirect_stdout(io.StringIO()):
-                        exec_time = run(
-                            mnkl=(m, n, k, l),
-                            expert_count=expert_count,
-                            ab_dtype=cutlass.Float4E2M1FN,
-                            sf_dtype=cutlass.Float8E8M0FNU,
-                            sf_vec_size=16,
-                            c_dtype=cutlass.Float16,
-                            a_major="k",
-                            b_major="k",
-                            c_major="n",
-                            mma_tiler_mn=mma_tiler_mn,
-                            cluster_shape_mn=cluster_shape_mn,
-                            warmup_iterations=WARMUP_ITERATIONS,
-                            iterations=ITERATIONS,
-                            skip_ref_check=False,
-                            use_cold_l2=False,
-                            use_cupti=True,
-                            split_k=split_k,
+                for swap_ab in SWAP_AB_VALUES:
+                    done += 1
+                    c_major = "m" if swap_ab else "n"
+                    tag = (
+                        f"m={m:4d}  tactic={mma_tiler_mn}/{cluster_shape_mn}"
+                        f"  split_k={split_k}  swap_ab={int(swap_ab)}  [{done}/{total}]"
+                    )
+                    try:
+                        with redirect_stdout(io.StringIO()):
+                            exec_time = run(
+                                mnkl=(m, n, k, l),
+                                expert_count=expert_count,
+                                ab_dtype=cutlass.Float4E2M1FN,
+                                sf_dtype=cutlass.Float8E8M0FNU,
+                                sf_vec_size=16,
+                                c_dtype=cutlass.Float16,
+                                a_major="k",
+                                b_major="k",
+                                c_major=c_major,
+                                mma_tiler_mn=mma_tiler_mn,
+                                cluster_shape_mn=cluster_shape_mn,
+                                warmup_iterations=WARMUP_ITERATIONS,
+                                iterations=ITERATIONS,
+                                skip_ref_check=False,
+                                use_cold_l2=True,
+                                use_cupti=True,
+                                split_k=split_k,
+                                swap_ab=swap_ab,
+                            )
+                        print(f"PASS  {tag}  -> {exec_time:.2f} us")
+                        rows.append(
+                            {
+                                "m": m,
+                                "n": n,
+                                "k": k,
+                                "l": l,
+                                "mma_tiler_m": mma_tiler_mn[0],
+                                "mma_tiler_n": mma_tiler_mn[1],
+                                "cluster_m": cluster_shape_mn[0],
+                                "cluster_n": cluster_shape_mn[1],
+                                "split_k": split_k,
+                                "swap_ab": int(swap_ab),
+                                "exec_time_us": f"{exec_time:.4f}",
+                                "status": "PASS",
+                            }
                         )
-                    print(f"PASS  {tag}  -> {exec_time:.2f} us")
-                    rows.append(
-                        {
-                            "m": m,
-                            "n": n,
-                            "k": k,
-                            "l": l,
-                            "mma_tiler_m": mma_tiler_mn[0],
-                            "mma_tiler_n": mma_tiler_mn[1],
-                            "cluster_m": cluster_shape_mn[0],
-                            "cluster_n": cluster_shape_mn[1],
-                            "split_k": split_k,
-                            "exec_time_us": f"{exec_time:.4f}",
-                            "status": "PASS",
-                        }
-                    )
-                except (TypeError, ValueError) as e:
-                    print(f"SKIP  {tag}  ({e})")
-                    rows.append(
-                        {
-                            "m": m,
-                            "n": n,
-                            "k": k,
-                            "l": l,
-                            "mma_tiler_m": mma_tiler_mn[0],
-                            "mma_tiler_n": mma_tiler_mn[1],
-                            "cluster_m": cluster_shape_mn[0],
-                            "cluster_n": cluster_shape_mn[1],
-                            "split_k": split_k,
-                            "exec_time_us": "",
-                            "status": f"SKIP: {e}",
-                        }
-                    )
+                    except (TypeError, ValueError) as e:
+                        print(f"SKIP  {tag}  ({e})")
+                        rows.append(
+                            {
+                                "m": m,
+                                "n": n,
+                                "k": k,
+                                "l": l,
+                                "mma_tiler_m": mma_tiler_mn[0],
+                                "mma_tiler_n": mma_tiler_mn[1],
+                                "cluster_m": cluster_shape_mn[0],
+                                "cluster_n": cluster_shape_mn[1],
+                                "split_k": split_k,
+                                "swap_ab": int(swap_ab),
+                                "exec_time_us": "",
+                                "status": f"SKIP: {e}",
+                            }
+                        )
 
     fieldnames = [
         "m",
@@ -200,6 +239,7 @@ def sweep(nkl, expert_count, output_path, m_values=None):
         "cluster_m",
         "cluster_n",
         "split_k",
+        "swap_ab",
         "exec_time_us",
         "status",
     ]
