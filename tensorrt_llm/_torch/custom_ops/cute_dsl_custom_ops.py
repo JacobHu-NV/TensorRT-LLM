@@ -367,7 +367,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self,
                      output_dtype: torch.dtype,
                      to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = True):
+                     use_tvm_ffi: bool = True,
+                     sm_budget: int = -1):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -377,8 +378,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.to_userbuffers = to_userbuffers
             self.use_tvm_ffi = use_tvm_ffi
+            self.sm_budget = sm_budget
 
         def unique_id(self):
+            # sm_budget is intentionally excluded: tuning is always performed
+            # with the full SM budget and the tactic is reused across all
+            # GreenContext SM partitions.  The actual sm_budget is applied at
+            # kernel-execution time (max_active_clusters).
             return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
 
         def get_valid_tactics(
@@ -623,8 +629,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 torch_stream = torch.cuda.current_stream()
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
+            hardware_info = cutlass.utils.HardwareInfo()
+            max_active_clusters_hw = hardware_info.get_max_active_clusters(
+                cluster_shape_mn[0] * cluster_shape_mn[1])
+            if self.sm_budget > 0:
+                cluster_sms = cluster_shape_mn[0] * cluster_shape_mn[1]
+                constrained = max(1, self.sm_budget // cluster_sms)
+                max_active_clusters = min(max_active_clusters_hw, constrained)
+            else:
+                max_active_clusters = max_active_clusters_hw
+
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch, self.use_tvm_ffi)
+                         use_prefetch, self.use_tvm_ffi, max_active_clusters)
             if swap_ab:
                 kernel_m = n
                 kernel_n = m
@@ -692,10 +708,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn,
                     use_prefetch,
                 )
-                # Compute max active clusters on current device
-                hardware_info = cutlass.utils.HardwareInfo()
-                max_active_clusters = hardware_info.get_max_active_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
                 # so we make alpha as the cute.Tensor type in the jit func.
@@ -777,6 +789,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
         use_tvm_ffi: bool = True,
+        sm_budget: int = -1,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -789,6 +802,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_dtype: Output data type (must be bfloat16)
             to_userbuffers: Whether to allocate output from UserBuffers pool
             use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
+            sm_budget: Number of physical SMs available (-1 = unconstrained).
+                When > 0, max_active_clusters is derived as
+                sm_budget // (cluster_m * cluster_n).  When -1, the budget is
+                auto-detected from the current stream's GreenContext.
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
@@ -802,19 +819,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
             )
 
+        # Auto-detect SM budget from the current stream's GreenContext.
+        if sm_budget == -1:
+            from tensorrt_llm._torch.modules.fused_moe.green_context import \
+                get_current_stream_gc_sm_count
+            detected = get_current_stream_gc_sm_count()
+            if detected > 0:
+                sm_budget = detected
+
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
-                                             use_tvm_ffi)
+        # Tuning runner: unconstrained (all SMs).  unique_id() intentionally
+        # excludes sm_budget so the autotuner cache is shared across all
+        # GreenContext partitions — the best tile/cluster shape is the same
+        # regardless of how many SMs are available.
+        tune_runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
+                                                  use_tvm_ffi)
+
+        # Execution runner: applies the actual SM budget so that
+        # max_active_clusters is correctly constrained at launch time.
+        exec_runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
+                                                  use_tvm_ffi,
+                                                  sm_budget=sm_budget)
+
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
-            [runner],
-            runner.__class__.tuning_config,
+            [tune_runner],
+            tune_runner.__class__.tuning_config,
             inputs,
         )
 
-        output = runner(inputs, tactic=best_tactic)
+        output = exec_runner(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake("trtllm::cute_dsl_nvfp4_gemm_blackwell")
@@ -827,6 +863,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
         use_tvm_ffi: bool = True,
+        sm_budget: int = -1,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -3410,7 +3447,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs,
         )
 
-        # print(f"{best_tactic=}")
+        print(f"[FC1] best_tactic={best_tactic}, sm_budget={exec_runner.sm_budget}")
 
         # Phase 2: execute with the SM budget reflecting the actual runtime
         # constraint (Green Context partition or unconstrained).
@@ -3465,7 +3502,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Input shapes:
         - A: (M, K) - activation tensor, K = weight_per_expert * expert_count
         - B: (N, K) - weight tensor
-        - alpha_scale: (M, expert_count) - per-token-per-expert scaling
+        - alpha_scale: (M, expert_count) - per-token-per-expert scaling,
+          must be TOKEN-MAJOR in memory (stride=1 along M). Typical pattern:
+          `torch.empty((expert_count, M), ...).t()`.
 
         Output shape:
         - C: (M, N)
@@ -3762,7 +3801,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight: Weight tensor (N, K//2) in fp4 packed format
             input_scale: Scale factor for input (swizzled)
             weight_scale: Scale factor for weight (swizzled)
-            alpha_scale: Per-token-per-expert scale (M, expert_count)
+            alpha_scale: Per-token-per-expert scale (M, expert_count);
+                must be token-major in memory (stride=1 along M).
             expert_count: Number of experts
             weight_per_expert: Number of weights per expert
             output_dtype: Output data type (bfloat16 or float16)
@@ -3796,6 +3836,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs,
         )
 
+        print(f"[FC2] best_tactic={best_tactic}")
         output = runner(inputs, tactic=best_tactic)
         return output
 
@@ -5810,9 +5851,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs,
         )
 
-        # print(
-        #     f"Chosen tactic for CuTe DSL BF16 GEMM: {best_tactic}, sm_budget={exec_runner.sm_budget}"
-        # )
+        print(
+            f"[Router] best_tactic={best_tactic}, sm_budget={exec_runner.sm_budget}"
+        )
 
         exec_runner(inputs, tactic=best_tactic)
 

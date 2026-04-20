@@ -28,7 +28,7 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -495,6 +495,7 @@ class ConfigurableMoE(MoE):
         router_weight_t = kwargs.get("router_weight_t")
         if router_weight_t is None and kwargs.get("router_weight") is not None:
             router_weight_t = kwargs["router_weight"].t()
+        shared_experts_fn = kwargs.get("shared_experts_fn")
 
         if num_chunks == 1:
             # Single chunk case
@@ -506,8 +507,15 @@ class ConfigurableMoE(MoE):
                 use_dp_padding,
                 do_finalize,
                 router_weight_t=router_weight_t,
+                shared_experts_fn=shared_experts_fn,
             )
         else:
+            # Multi-chunk path re-runs the backend per chunk; a callable shared
+            # expert would be executed once per chunk, which is incorrect.  Fail
+            # fast so that callers don't silently lose the shared contribution.
+            assert shared_experts_fn is None, (
+                "shared_experts_fn is not supported when num_chunks > 1"
+            )
             # Multiple chunks case
             outputs = self._forward_multiple_chunks(
                 x,
@@ -577,6 +585,7 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
         router_weight_t: Optional[torch.Tensor] = None,
+        shared_experts_fn: Optional[Any] = None,
     ) -> torch.Tensor:
         """
         Single chunk execution path
@@ -601,6 +610,7 @@ class ConfigurableMoE(MoE):
             do_finalize,
             workspace=workspace,
             router_weight_t=router_weight_t,
+            shared_experts_fn=shared_experts_fn,
         )
 
         return outputs
@@ -617,6 +627,7 @@ class ConfigurableMoE(MoE):
         do_finalize: bool = True,
         workspace: Optional[dict] = None,
         router_weight_t: Optional[torch.Tensor] = None,
+        shared_experts_fn: Optional[Any] = None,
     ) -> torch.Tensor:
         """
         Unified execution flow for all backends
@@ -852,6 +863,7 @@ class ConfigurableMoE(MoE):
                 workspace,
                 router_weight_t=router_weight_t,
                 router_input=densegemm_router_input,
+                shared_experts_fn=shared_experts_fn,
             ),
         )
 
@@ -1170,6 +1182,7 @@ class ConfigurableMoE(MoE):
         workspace: Optional[dict] = None,
         router_weight_t: Optional[torch.Tensor] = None,
         router_input: Optional[torch.Tensor] = None,
+        shared_experts_fn: Optional[Any] = None,
     ) -> Dict:
         """
         Get backend-specific keyword arguments for run_moe
@@ -1264,6 +1277,8 @@ class ConfigurableMoE(MoE):
                 kwargs["router_weight_t"] = router_weight_t
             if router_input is not None:
                 kwargs["router_input"] = router_input
+            if shared_experts_fn is not None:
+                kwargs["shared_experts_fn"] = shared_experts_fn
 
         # TRTLLMGen-specific parameters
         elif self.backend.__class__ == TRTLLMGenFusedMoE:

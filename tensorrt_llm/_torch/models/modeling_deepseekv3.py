@@ -577,25 +577,6 @@ class DeepseekV3WeightLoader:
                         "up_proj": "w3",
                         "gate_proj": "w1",
                     })
-                    # For DenseGEMM with fused shared expert: inject shared expert
-                    # weights as the last expert (index num_experts).
-                    grandparent_name = '.'.join(
-                        names[:-2])  # e.g. "model.layers.3.mlp"
-                    parent_mlp = all_named_modules.get(grandparent_name)
-                    if getattr(parent_mlp, '_fuse_shared_expert', False):
-                        shared_prefix = grandparent_name + ".shared_experts"
-                        shared_raw = filter_weights(shared_prefix, weights)
-                        shared_renamed = rename_moe_weight(
-                            shared_raw, {
-                                "down_proj": "w2",
-                                "up_proj": "w3",
-                                "gate_proj": "w1",
-                            })
-                        shared_idx = module.num_experts - 1
-                        for k, v in shared_renamed.items():
-                            module_weights[f"{shared_idx}.{k}"] = v
-                        if can_mark_consumed:
-                            weights.mark_consumed(shared_prefix)
                     module.load_weights(weights=[module_weights])
                     # Mark consumed MoE weights using parent name
                     if can_mark_consumed:
@@ -954,16 +935,23 @@ class Deepseekv3MoE(nn.Module):
             moe_backend=model_config.moe_backend,
             use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
 
-        # For DenseGEMM, fuse the shared expert as the last expert in the dense
-        # GEMM kernel (index num_experts), always activated with scale=1.0.
-        # This avoids a separate GatedMLP forward and add operation.
-        self._fuse_shared_expert = model_config.moe_backend.upper(
+        # For DenseGEMM, the shared expert is a separate GatedMLP whose forward
+        # is scheduled on the MoE's aux stream, overlapping with the router flow
+        # (and thus with FC1 on the main stream).  See
+        # fused_moe_densegemm_smp.py::_run_moe_nvfp4_smp_impl for the schedule.
+        # The old path (shared expert packed into the dense GEMM experts tensor)
+        # is preserved in fc2_fused_shared_expert.back.txt.
+        self._overlap_shared_expert_in_moe = model_config.moe_backend.upper(
         ) == 'DENSEGEMM'
+        # Backward-compat alias: external benchmark scripts (tests/scripts/...)
+        # still read `_fuse_shared_expert` to decide whether to pack shared
+        # weights into the dense GEMM tensor.  We no longer do that, so expose
+        # the attribute as False to keep those scripts running.
+        self._fuse_shared_expert = False
         self.num_routed_experts = num_experts
-        fused_num_experts = num_experts + 1 if self._fuse_shared_expert else num_experts
 
         self.experts = create_moe(
-            num_experts=fused_num_experts,
+            num_experts=num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -986,42 +974,36 @@ class Deepseekv3MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        if self._fuse_shared_expert:
-            # Shared expert is fused into self.experts; no separate module needed.
-            self.shared_experts = None
-            self.shared_output_scale = None
-            self.shared_experts_use_fp4 = False
-        else:
-            shared_quant_config = self._get_shared_experts_quant_config(
-                model_config, layer_idx)
-            shared_model_config = model_config
-            if shared_quant_config is not model_config.quant_config:
-                shared_model_config = copy.copy(model_config)
-                shared_model_config.quant_config = shared_quant_config
+        shared_quant_config = self._get_shared_experts_quant_config(
+            model_config, layer_idx)
+        shared_model_config = model_config
+        if shared_quant_config is not model_config.quant_config:
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = shared_quant_config
 
-            # For shared experts, use the block size implied by their quant config.
-            block_size = 1
-            if (shared_quant_config is not None
-                    and shared_quant_config.quant_algo is not None
-                    and shared_quant_config.group_size is not None):
-                block_size = shared_quant_config.group_size
+        # For shared experts, use the block size implied by their quant config.
+        block_size = 1
+        if (shared_quant_config is not None
+                and shared_quant_config.quant_algo is not None
+                and shared_quant_config.group_size is not None):
+            block_size = shared_quant_config.group_size
 
-            shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
-                shared_expert_intermediate_size, block_size)
+        shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
+            shared_expert_intermediate_size, block_size)
 
-            self.shared_experts = GatedMLP(
-                hidden_size=hidden_size,
-                intermediate_size=shared_expert_intermediate_size,
-                bias=False,
-                dtype=dtype,
-                config=shared_model_config,
-                overridden_tp_size=shared_tp_size,
-                reduce_output=False,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-            )
-            self.shared_experts_use_fp4 = (
-                shared_quant_config is not None
-                and shared_quant_config.layer_quant_mode.has_nvfp4())
+        self.shared_experts = GatedMLP(
+            hidden_size=hidden_size,
+            intermediate_size=shared_expert_intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=shared_model_config,
+            overridden_tp_size=shared_tp_size,
+            reduce_output=False,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+        )
+        self.shared_experts_use_fp4 = (
+            shared_quant_config is not None
+            and shared_quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1044,6 +1026,72 @@ class Deepseekv3MoE(nn.Module):
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
                 dtype=torch.float32)
+
+    def _run_shared_experts_cute_dsl(self, x: torch.Tensor,
+                                     sm_budget: int) -> torch.Tensor:
+        """Run the shared expert, bypassing GatedMLP.forward for sm_budget control.
+
+        Supports both BF16 (cute_dsl_bf16_gemm_blackwell) and NVFP4
+        (nvfp4_gemm) weight formats.
+        """
+        gate_up_proj = self.shared_experts.gate_up_proj
+        down_proj = self.shared_experts.down_proj
+        gate_up_w = gate_up_proj.weight
+        down_w = down_proj.weight
+
+        x = x.contiguous()
+        m = x.shape[0]
+
+        if self.shared_experts_use_fp4:
+            # NVFP4 path: weights are uint8 (packed fp4).
+            # FC1: gate+up projection, weight shape [2*inter_local, hidden//2].
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                x, gate_up_proj.input_scale, gate_up_proj.scaling_vector_size,
+                False)
+            gate_up = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                act_fp4, gate_up_w, act_sf, gate_up_proj.weight_scale,
+                gate_up_proj.alpha, torch.bfloat16, sm_budget=sm_budget)
+
+            # SwiGLU activation: silu(gate) * up, producing [M, inter_local].
+            activated = torch.ops.trtllm.silu_and_mul(gate_up)
+
+            # FC2: down projection, weight shape [hidden, inter_local//2].
+            act_fp4_2, act_sf_2 = torch.ops.trtllm.fp4_quantize(
+                activated.contiguous(), down_proj.input_scale,
+                down_proj.scaling_vector_size, False)
+            out = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                act_fp4_2, down_w, act_sf_2, down_proj.weight_scale,
+                down_proj.alpha, torch.bfloat16, sm_budget=sm_budget)
+            return out
+        else:
+            # BF16 path: use CuteDSL BF16 GEMM with sm_budget control.
+            assert gate_up_w.dtype == torch.bfloat16 and down_w.dtype == torch.bfloat16, (
+                "Shared expert weights must be BF16 for cute_dsl_bf16_gemm_blackwell; "
+                f"got gate_up={gate_up_w.dtype}, down={down_w.dtype}.")
+            two_inter_local = gate_up_w.shape[0]
+            hidden = gate_up_w.shape[1]
+
+            # FC1: fused gate+up projection.  weight shape is [2*inter_local, hidden].
+            gate_up = torch.empty(m,
+                                  two_inter_local,
+                                  dtype=torch.bfloat16,
+                                  device=x.device)
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(x,
+                                                           gate_up_w,
+                                                           gate_up,
+                                                           sm_budget=sm_budget)
+
+            # SwiGLU activation: silu(gate) * up, producing [M, inter_local].
+            activated = torch.ops.trtllm.silu_and_mul(gate_up)
+
+            # FC2: down projection.  weight shape is [hidden, inter_local].
+            out = torch.empty(m,
+                              hidden,
+                              dtype=torch.bfloat16,
+                              device=x.device)
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+                activated.contiguous(), down_w, out, sm_budget=sm_budget)
+            return out
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1152,27 +1200,48 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
-        router_logits = self.gate(hidden_states)
-
-        # Use ideal load balanced logits if enabled, otherwise use gate output.
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
-            # Only use this for testing load balancing strategies, not for actual inference.
-            # The gate is still computed to maintain realistic performance measurement.
-            num_tokens, num_experts = router_logits.shape
-            router_logits = self._create_ideal_expert_load_balanced_logits(
-                num_tokens=num_tokens,
-                num_experts=num_experts,
-                device=hidden_states.device)
-
         is_densegemm = self.gate.moe_backend.upper() == 'DENSEGEMM'
+
         if is_densegemm:
+            # Router GEMM is fused inside the DenseGEMM kernel; skip it here.
             # DenseGEMM handles routing and FP4 quantization internally.
             # Pass BF16 hidden_states so quantize_input() works correctly, and
-            # provide router_weight_t for the internal routing GEMM.
+            # provide router_weight_t for the internal routing GEMM.  The shared
+            # expert runs inside the MoE layer on its aux stream, overlapped with
+            # the router flow (see fused_moe_densegemm_smp.py); pass a callable
+            # that produces shared_output when invoked.
+            router_logits = None
             expert_input = hidden_states
             extra_kwargs = {"router_weight_t": self.gate.weight.t()}
+            if self.shared_experts is not None:
+
+                def _shared_experts_fn(shared_input, sm_budget):
+                    # DenseGEMM passes BF16 router_input here; during autotuning
+                    # the AutoTuner buckets `router_input` so shapes automatically
+                    # line up with the MoE output.  `sm_budget` controls
+                    # max_active_clusters on the cute_dsl BF16 GEMM, matching the
+                    # router-GEMM pattern on the same aux stream.
+                    out = self._run_shared_experts_cute_dsl(
+                        shared_input, sm_budget)
+                    if self.shared_output_scale is not None:
+                        out = out * self.shared_output_scale
+                    return out
+
+                extra_kwargs["shared_experts_fn"] = _shared_experts_fn
         else:
+            router_logits = self.gate(hidden_states)
+
+            # Use ideal load balanced logits if enabled, otherwise use gate output.
+            if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+                # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
+                # Only use this for testing load balancing strategies, not for actual inference.
+                # The gate is still computed to maintain realistic performance measurement.
+                num_tokens, num_experts = router_logits.shape
+                router_logits = self._create_ideal_expert_load_balanced_logits(
+                    num_tokens=num_tokens,
+                    num_experts=num_experts,
+                    device=hidden_states.device)
+
             expert_input = (hidden_states_fp4
                             if hidden_states_fp4 is not None else hidden_states)
             extra_kwargs = {}
@@ -1203,9 +1272,10 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             assert not self.use_dp
 
-        if self._fuse_shared_expert:
-            # Shared expert is fused into self.experts (DenseGEMM always-active
-            # expert at index num_routed_experts).  No separate forward needed.
+        if self._overlap_shared_expert_in_moe:
+            # DenseGEMM path: shared expert is executed inside self.experts on the
+            # MoE's aux stream (overlapped with the router flow, hence with FC1).
+            # The returned tensor already contains FC2 + shared_output.
             final_hidden_states = self.compute_routed_output(
                 hidden_states, hidden_states_fp4, all_rank_num_tokens,
                 do_finalize)

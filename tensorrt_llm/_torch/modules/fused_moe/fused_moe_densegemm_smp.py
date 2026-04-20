@@ -162,6 +162,7 @@ class DenseGEMMSMPSMRunner(TunableRunner):
         *,
         tactic: Any = -1,
         do_preparation: bool = False,
+        shared_experts_fn: Optional[Any] = None,
         **kwargs,
     ) -> torch.Tensor:
         x, x_sf, router_weight_t, router_input = inputs
@@ -192,14 +193,26 @@ class DenseGEMMSMPSMRunner(TunableRunner):
             for cand_fc1_sms in candidates:
                 try:
                     self.moe._run_moe_nvfp4_smp_impl(
-                        x, x_sf, router_weight_t, router_input, cand_fc1_sms
+                        x,
+                        x_sf,
+                        router_weight_t,
+                        router_input,
+                        cand_fc1_sms,
+                        shared_experts_fn=shared_experts_fn,
                     )
                 except Exception as e:
                     logger.warning(
                         f"[DenseGEMMSMPSMRunner] preparation failed for "
                         f"fc1_sms={cand_fc1_sms}, num_tokens={num_tokens}: {e}"
                     )
-        return self.moe._run_moe_nvfp4_smp_impl(x, x_sf, router_weight_t, router_input, fc1_sms)
+        return self.moe._run_moe_nvfp4_smp_impl(
+            x,
+            x_sf,
+            router_weight_t,
+            router_input,
+            fc1_sms,
+            shared_experts_fn=shared_experts_fn,
+        )
 
 
 class DenseGEMMFusedMoE(MoE):
@@ -375,7 +388,7 @@ class DenseGEMMFusedMoE(MoE):
         if AuxStreamType.MoeFc2Alpha not in self.aux_stream_dict:
             self.aux_stream_dict[AuxStreamType.MoeFc2Alpha] = torch.cuda.Stream(priority=-1)
         self.event_dict = {}
-        for key in [EventType.Main, EventType.MoeFc2Alpha]:
+        for key in [EventType.Main, EventType.MoeFc2Alpha, EventType.MoeShared]:
             self.event_dict[key] = torch.cuda.Event()
 
         # Weight creation
@@ -573,11 +586,13 @@ class DenseGEMMFusedMoE(MoE):
 
         # FC2: explicitly autotune with full SM.
         # Use dummy fc2_alpha (all-ones) since only the shape matters for tiling.
+        # FC2 kernel expects token-major layout (stride=1 along token dim):
+        # allocate (expert, tokens) then .t() to get a (tokens, expert) view with stride (1, tokens).
         _dummy_fc2_alpha = torch.ones(
-            [num_tokens, self.expert_size_per_partition],
+            [self.expert_size_per_partition, num_tokens],
             dtype=torch.float32,
             device=x.device,
-        )
+        ).t()
         torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
             fc1_output,
             self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
@@ -597,6 +612,7 @@ class DenseGEMMFusedMoE(MoE):
         router_weight_t: torch.Tensor,
         router_input: torch.Tensor,
         fc1_sms: int,
+        shared_experts_fn: Optional[Any] = None,
     ) -> torch.Tensor:
         """Execute the SMP overlap path with the given FC1 SM budget.
 
@@ -607,6 +623,17 @@ class DenseGEMMFusedMoE(MoE):
             router_input: Input fed to the router GEMM ``[num_tokens, hidden_size]``.
             fc1_sms: Requested SM count for FC1 (soft budget via sm_budget hint).
                      The router receives ``num_sms - fc1_sms`` SMs.
+            shared_experts_fn: Optional callable ``(input, sm_budget) -> Tensor``
+                that produces the DeepSeek shared-expert output in the shape of
+                ``final_hidden_states``.  ``input`` is the BF16 hidden-states
+                tensor (``router_input``); ``sm_budget`` is the soft SM cap to
+                pass to the shared expert's BF16 GEMMs (we use ``router_sms`` so
+                the shared expert doesn't steal SMs from FC1).  Passing input
+                explicitly keeps computation in sync with the AutoTuner's
+                bucketed shapes.  When provided, it is scheduled on the aux
+                stream right after the router flow (so it overlaps with FC1 on
+                the main stream) and its result is added into the final output
+                after FC2.
 
         Returns:
             ``final_hidden_states`` tensor of shape ``[num_tokens, hidden_size]``.
@@ -617,12 +644,14 @@ class DenseGEMMFusedMoE(MoE):
         x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
 
         capture_graph = torch.cuda.is_current_stream_capturing()
+        # FC2 kernel expects token-major alpha (stride=1 along token dim):
+        # allocate (expert, tokens) physically, .t() to (tokens, expert) view with stride (1, tokens).
         fc2_alpha_buffer = DenseGEMMFusedMoE.buffers.get_buffer(
-            (num_tokens, self.expert_size_per_partition),
+            (self.expert_size_per_partition, num_tokens),
             dtype=torch.float32,
             buffer_name="fc2_alpha",
             reserve_buffer=capture_graph,
-        )
+        ).t()
 
         # Record dependency so the aux stream sees consistent inputs.
         self.event_dict[EventType.Main].record()
@@ -643,7 +672,13 @@ class DenseGEMMFusedMoE(MoE):
             sm_budget=fc1_sms,
         )
 
-        # Step 2: launch Router flow on the aux stream.
+        # Step 2: launch Router flow (+ optional shared-expert compute) on the aux
+        # stream.  The shared expert is chained AFTER the router flow on the same
+        # aux stream so that its GEMMs fill out the time FC1 is still running on
+        # the main stream.  We use two events so that FC2 only waits on the small
+        # fc2_alpha gen, and the (larger) shared-expert result is awaited lazily
+        # just before the in-place add.
+        shared_output = None
         with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
             self.event_dict[EventType.Main].wait()
             m, n = router_input.shape[0], router_weight_t.shape[1]
@@ -656,24 +691,6 @@ class DenseGEMMFusedMoE(MoE):
             )
             token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
             token_selected_experts = token_selected_experts.to(torch.int32)
-            # Append fused shared experts (always active, scale=1.0) if any.
-            num_routing_experts = router_weight_t.shape[1]
-            if self.expert_size_per_partition > num_routing_experts:
-                n_shared = self.expert_size_per_partition - num_routing_experts
-                M_tok = router_input.shape[0]
-                shared_ids = (
-                    torch.arange(
-                        num_routing_experts,
-                        self.expert_size_per_partition,
-                        dtype=torch.int32,
-                        device=x.device,
-                    )
-                    .unsqueeze(0)
-                    .expand(M_tok, n_shared)
-                )
-                shared_scales = torch.ones(M_tok, n_shared, dtype=torch.float32, device=x.device)
-                token_selected_experts = torch.cat([token_selected_experts, shared_ids], dim=1)
-                token_final_scales = torch.cat([token_final_scales, shared_scales], dim=1)
             fc2_alpha = gen_fc2_alpha_fused(
                 token_selected_experts,
                 token_final_scales,
@@ -681,8 +698,18 @@ class DenseGEMMFusedMoE(MoE):
                 output=fc2_alpha_buffer,
             )
             self.event_dict[EventType.MoeFc2Alpha].record()
+            if shared_experts_fn is not None:
+                # Use router_sms as the SM budget so the shared-expert GEMMs
+                # leave room for FC1 on the main stream.
+                shared_output = shared_experts_fn(router_input, router_sms)
+                self.event_dict[EventType.MoeShared].record()
 
         self.event_dict[EventType.MoeFc2Alpha].wait()
+
+        _delay_us = int(os.environ.get("TRTLLM_PROBE_DELAY_US", "0"))
+        if _delay_us > 0:
+            from tensorrt_llm.bindings.internal.runtime import delay_kernel
+            delay_kernel(_delay_us, torch.cuda.current_stream())
 
         # FC2: input k = expert_count * intermediate_size (after SwiGLU)
         final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
@@ -696,6 +723,9 @@ class DenseGEMMFusedMoE(MoE):
             output_dtype=torch.bfloat16,
             scaling_vector_size=self.scaling_vector_size,
         )
+        if shared_output is not None:
+            self.event_dict[EventType.MoeShared].wait()
+            final_hidden_states.add_(shared_output)
         return final_hidden_states
 
     def run_moe_nvfp4(
@@ -707,6 +737,7 @@ class DenseGEMMFusedMoE(MoE):
         enable_alltoall: bool = False,
         router_weight_t: Optional[torch.Tensor] = None,
         router_input: Optional[torch.Tensor] = None,
+        shared_experts_fn: Optional[Any] = None,
     ) -> torch.Tensor:
         """Run MoE computation with NVFP4 quantization using SM-partition stream overlap.
 
@@ -718,6 +749,10 @@ class DenseGEMMFusedMoE(MoE):
             enable_alltoall: Whether alltoall communication is enabled
             router_weight_t: Router weight matrix [hidden, num_experts] (transposed)
             router_input: Optional separate router input; defaults to x if None
+            shared_experts_fn: Optional callable ``() -> Tensor`` that produces the
+                shared-expert output (shape ``[num_tokens, hidden_size]``) to be
+                added into the MoE result.  Scheduled on the aux stream after the
+                router flow so it overlaps with FC1.
 
         Note:
             The implementation is controlled by TRTLLM_MOE_FUSED_FC2_ALPHA env var (default: disabled).
@@ -769,24 +804,15 @@ class DenseGEMMFusedMoE(MoE):
             assert token_final_scales is not None
             assert token_final_scales.dtype == torch.float32
 
-            # Append fused shared experts (always active, scale=1.0) if any.
-            num_routing_experts = router_weight_t.shape[1]
-            if self.expert_size_per_partition > num_routing_experts:
-                n_shared = self.expert_size_per_partition - num_routing_experts
-                M_tok = router_input.shape[0]
-                shared_ids = (
-                    torch.arange(
-                        num_routing_experts,
-                        self.expert_size_per_partition,
-                        dtype=torch.int32,
-                        device=x.device,
-                    )
-                    .unsqueeze(0)
-                    .expand(M_tok, n_shared)
-                )
-                shared_scales = torch.ones(M_tok, n_shared, dtype=torch.float32, device=x.device)
-                token_selected_experts = torch.cat([token_selected_experts, shared_ids], dim=1)
-                token_final_scales = torch.cat([token_final_scales, shared_scales], dim=1)
+            # Shared expert is now handled as a separate module overlapped via
+            # the SMP path; in this fused-fc2-alpha branch the router runs on
+            # the main stream, so we simply run the shared expert sequentially
+            # and add it into the MoE result at the end.  Use the configured
+            # router_sms budget for consistency with the SMP overlap path.
+            shared_output = (
+                shared_experts_fn(router_input, self.router_sms)
+                if shared_experts_fn is not None else None
+            )
 
             # New implementation: fuse fc2_alpha into FC1's alpha_post
             x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
@@ -826,6 +852,8 @@ class DenseGEMMFusedMoE(MoE):
                 to_userbuffers=False,
                 allowed_backends="cutlass,cublaslt,cutedsl,cuda_core",
             )
+            if shared_output is not None:
+                final_hidden_states.add_(shared_output)
         else:
             # SM Partition path: use AutoTuner to find the optimal FC1 SM split.
             # Pass unswizzled x_sf so the constraint spec (shape[0] == num_tokens)
@@ -838,11 +866,14 @@ class DenseGEMMFusedMoE(MoE):
                 [runner],
                 runner.get_tuning_config(),
                 inputs,
+                shared_experts_fn=shared_experts_fn,
             )
 
-            # print(f"best_tactic: {best_tactic}")
-
-            final_hidden_states = runner(inputs, tactic=best_tactic)
+            final_hidden_states = runner(
+                inputs,
+                tactic=best_tactic,
+                shared_experts_fn=shared_experts_fn,
+            )
 
         return final_hidden_states
 
@@ -881,6 +912,7 @@ class DenseGEMMFusedMoE(MoE):
             enable_alltoall=enable_alltoall,
             router_weight_t=kwargs.get("router_weight_t"),
             router_input=kwargs.get("router_input"),
+            shared_experts_fn=kwargs.get("shared_experts_fn"),
         )
 
     def forward_chunk(
