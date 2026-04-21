@@ -653,6 +653,17 @@ class DenseGEMMFusedMoE(MoE):
             reserve_buffer=capture_graph,
         ).t()
 
+        # Pre-allocate FC2 output buffer so it can be zero-filled on the aux
+        # stream during FC1 overlap, hiding the init cost from the critical path.
+        # zero_() always runs regardless of split_k, ensuring the buffer is clean
+        # before FC2's atomic adds (split_k > 1) or TMA store (split_k == 1).
+        fc2_output_buffer = DenseGEMMFusedMoE.buffers.get_buffer(
+            (num_tokens, self.hidden_size),
+            dtype=torch.bfloat16,
+            buffer_name="fc2_output",
+            reserve_buffer=capture_graph,
+        )
+
         # Record dependency so the aux stream sees consistent inputs.
         self.event_dict[EventType.Main].record()
 
@@ -697,6 +708,10 @@ class DenseGEMMFusedMoE(MoE):
                 self.fc2_alpha,
                 output=fc2_alpha_buffer,
             )
+            # Zero-fill FC2 output buffer now, overlapping with FC1 on the main
+            # stream. This moves the memset off the FC2 critical path and
+            # guarantees the buffer is clean for split_k > 1 atomic adds.
+            fc2_output_buffer.zero_()
             self.event_dict[EventType.MoeFc2Alpha].record()
             if shared_experts_fn is not None:
                 # Use router_sms as the SM budget so the shared-expert GEMMs
@@ -711,18 +726,22 @@ class DenseGEMMFusedMoE(MoE):
             from tensorrt_llm.bindings.internal.runtime import delay_kernel
             delay_kernel(_delay_us, torch.cuda.current_stream())
 
-        # FC2: input k = expert_count * intermediate_size (after SwiGLU)
-        final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+        # FC2: input k = expert_count * intermediate_size (after SwiGLU).
+        # Use the inplace op so FC2 writes into fc2_output_buffer (pre-zeroed
+        # on the aux stream above).  Returns None; result lives in the buffer.
+        torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_inplace_blackwell(
             fc1_output,
             self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
             fc1_output_sf.reshape(-1),
             self.w2_weight_scale,
             fc2_alpha,
+            fc2_output_buffer,
             expert_count=self.expert_size_per_partition,
             weight_per_expert=self.intermediate_size_per_partition,
             output_dtype=torch.bfloat16,
             scaling_vector_size=self.scaling_vector_size,
         )
+        final_hidden_states = fc2_output_buffer
         if shared_output is not None:
             self.event_dict[EventType.MoeShared].wait()
             final_hidden_states.add_(shared_output)

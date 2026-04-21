@@ -3637,12 +3637,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self,
             inputs: List[torch.Tensor],
             tactic: Optional[Tuple[Tuple[int, int], Tuple[int, int], int]],
+            output: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute the dense GEMM FC2.
 
             Args:
                 inputs: [a, b, a_sf, b_sf, alpha_scale]
                 tactic: ((mma_m, mma_n), (cluster_m, cluster_n), split_k)
+                output: Optional pre-allocated output buffer. When provided the
+                    caller is responsible for zero-initialising it before FC2
+                    runs (required for split_k > 1 atomic-add correctness).
 
             Returns:
                 Output tensor
@@ -3667,7 +3671,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Allocate output tensor
             c_dtype = self.output_dtype
-            if split_k > 1:
+            if output is not None:
+                # Caller pre-allocated and pre-zeroed the buffer (e.g. on aux
+                # stream during FC1 overlap). Use it directly.
+                c = output
+            elif split_k > 1:
                 # Atomic reduction accumulates onto C; must be zero-initialized
                 c = torch.zeros((m, n), dtype=c_dtype, device=a.device)
             else:
@@ -3837,8 +3845,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
 
         print(f"[FC2] best_tactic={best_tactic}")
-        output = runner(inputs, tactic=best_tactic)
-        return output
+        result = runner(inputs, tactic=best_tactic)
+        return result
 
     @torch.library.register_fake(
         "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_blackwell")
@@ -3856,9 +3864,77 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # input: [m, k//2] (fp4 packed), weight: [n, k//2]
         m = input.shape[0]
         n = weight.shape[0]
+        return input.new_empty((m, n), dtype=output_dtype)
 
-        output = input.new_empty((m, n), dtype=output_dtype)
-        return output
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_inplace_blackwell",
+        mutates_args=("output", ),
+        device_types="cuda",
+    )
+    def cute_dsl_nvfp4_dense_gemm_fc2_inplace_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha_scale: torch.Tensor,
+        output: torch.Tensor,
+        expert_count: int,
+        weight_per_expert: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        """Inplace variant of cute_dsl_nvfp4_dense_gemm_fc2_blackwell.
+
+        Writes the FC2 result directly into ``output``, which must be
+        pre-allocated and pre-zeroed by the caller (required for split_k > 1
+        atomic-add correctness).  Returns None; the caller uses ``output``
+        directly as the result tensor.
+
+        This enables the SMP overlap path to zero ``output`` on the aux stream
+        during FC1, hiding the memset from the FC2 critical path.
+        """
+        _MMA_TILE_K = 256
+        assert weight_per_expert % _MMA_TILE_K == 0, (
+            f"cute_dsl_nvfp4_dense_gemm_fc2_inplace_blackwell requires "
+            f"weight_per_expert to be a multiple of {_MMA_TILE_K} "
+            f"(got {weight_per_expert})")
+
+        runner = CuteDSLNVFP4DenseGemmFC2Runner(
+            expert_count=expert_count,
+            weight_per_expert=weight_per_expert,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
+        )
+
+        inputs = [input, weight, input_scale, weight_scale, alpha_scale]
+
+        tuner = AutoTuner.get()
+        # Reuse the same autotuner key as the non-inplace op so tactics are shared.
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+
+        print(f"[FC2 inplace] best_tactic={best_tactic}")
+        runner(inputs, tactic=best_tactic, output=output)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_inplace_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha_scale: torch.Tensor,
+        output: torch.Tensor,
+        expert_count: int,
+        weight_per_expert: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        return None
 
     def _get_num_sms() -> int:
         """Return the number of SMs on the current device (cached)."""
