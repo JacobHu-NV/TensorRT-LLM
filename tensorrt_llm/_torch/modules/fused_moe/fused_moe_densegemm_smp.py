@@ -667,28 +667,10 @@ class DenseGEMMFusedMoE(MoE):
         # Record dependency so the aux stream sees consistent inputs.
         self.event_dict[EventType.Main].record()
 
-        # Step 1: launch FC1 on the main stream with soft SM budget.
-        fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
-            x,
-            self.w3_w1_weight.view(torch.uint8),
-            x_sf,
-            self.w3_w1_weight_scale,
-            self.fc31_alpha,
-            None,  # alpha_post: no post-SwiGLU scaling
-            self.fc2_input_scale,
-            expert_count=self.expert_size_per_partition,
-            weight_per_expert=2 * self.intermediate_size_per_partition,
-            output_dtype=torch.float4_e2m1fn_x2,
-            scaling_vector_size=self.scaling_vector_size,
-            sm_budget=fc1_sms,
-        )
-
-        # Step 2: launch Router flow (+ optional shared-expert compute) on the aux
-        # stream.  The shared expert is chained AFTER the router flow on the same
-        # aux stream so that its GEMMs fill out the time FC1 is still running on
-        # the main stream.  We use two events so that FC2 only waits on the small
-        # fc2_alpha gen, and the (larger) shared-expert result is awaited lazily
-        # just before the in-place add.
+        # Step 1: launch Router flow (+ optional shared-expert compute) on the aux
+        # stream BEFORE FC1, so that the router GEMM is already queued and ready
+        # to occupy SMs as soon as the event fires — reducing the risk that FC1's
+        # PDL early-dispatch starves the router of SMs.
         shared_output = None
         with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
             self.event_dict[EventType.Main].wait()
@@ -718,6 +700,22 @@ class DenseGEMMFusedMoE(MoE):
                 # leave room for FC1 on the main stream.
                 shared_output = shared_experts_fn(router_input, router_sms)
                 self.event_dict[EventType.MoeShared].record()
+
+        # Step 2: launch FC1 on the main stream with soft SM budget.
+        fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+            x,
+            self.w3_w1_weight.view(torch.uint8),
+            x_sf,
+            self.w3_w1_weight_scale,
+            self.fc31_alpha,
+            None,  # alpha_post: no post-SwiGLU scaling
+            self.fc2_input_scale,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=2 * self.intermediate_size_per_partition,
+            output_dtype=torch.float4_e2m1fn_x2,
+            scaling_vector_size=self.scaling_vector_size,
+            sm_budget=fc1_sms,
+        )
 
         self.event_dict[EventType.MoeFc2Alpha].wait()
 

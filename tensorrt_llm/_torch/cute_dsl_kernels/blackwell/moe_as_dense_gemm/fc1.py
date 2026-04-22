@@ -24,7 +24,13 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import fmin, silu_f32
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    fmin,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+    silu_f32,
+)
 
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled
@@ -683,6 +689,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
@@ -982,6 +989,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.arch.cluster_wait()
         else:
             self.cta_sync_barrier.arrive_and_wait()
+
+        # PDL: wait for previous grid (e.g. input quantization) to finish.
+        griddepcontrol_wait()
 
         #
         # Specialized TMA load warp
@@ -1819,6 +1829,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+        # PDL: hint the next dependent kernel (FC2) to launch early so its
+        # prologue overlaps with FC1's tail.
+        griddepcontrol_launch_dependents()
 
     def mainloop_s2t_copy_and_partition(
         self,

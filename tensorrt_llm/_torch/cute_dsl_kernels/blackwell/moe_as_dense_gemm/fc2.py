@@ -25,7 +25,10 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..utils import (
+    TRTLLM_ENABLE_PDL,
     atomic_add_func,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp16x8,
     vectorized_atomic_add_fp32x2,
@@ -709,6 +712,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
@@ -1009,6 +1013,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.arch.cluster_wait()
         else:
             self.cta_sync_barrier.arrive_and_wait()
+
+        # PDL: wait for previous grid (FC1) to finish before reading A/SFA.
+        griddepcontrol_wait()
 
         #
         # Specialized TMA load warp
@@ -1965,6 +1972,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             if cutlass.const_expr(self.split_k <= 1):
                 c_pipeline.producer_tail()
+
+        # PDL: hint the next dependent kernel to launch early.
+        griddepcontrol_launch_dependents()
 
     def mainloop_s2t_copy_and_partition(
         self,
